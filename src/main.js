@@ -9,8 +9,10 @@ import { ReplayBuffer } from './data/replayBuffer.js';
 import { PlaybackClock } from './engine/clock.js';
 import { buildTrack } from './track/trackBuilder.js';
 import { Hud } from './ui/hud.js';
+import { DriverPanel } from './ui/driverPanel.js';
 import { SessionPicker, Transport, initSettings } from './ui/controls.js';
 import { LiveBlockError } from './api/openf1.js';
+import { focusTrackColors } from './data/timing.js';
 
 const CAR_GLTF_URL = `${import.meta.env.BASE_URL}assets/car.glb`;
 
@@ -20,7 +22,8 @@ const dom = {
   banner: document.getElementById('banner'),
 };
 
-let renderer, carMgr, store, buffer, clock, hud, transport;
+let renderer, carMgr, store, buffer, clock, hud, transport, driverPanel, track;
+let focused = false; // a driver is focused (camera follow + sector track tint)
 let running = false;
 let liveRetryTimer = null;
 
@@ -65,6 +68,7 @@ async function boot() {
   }
 
   renderer = new IsoRenderer(document.getElementById('scene'));
+  initClickToFocus();
 
   // If a CC0 car model is bundled at public/assets/car.glb, use it; otherwise
   // the procedural low-poly F1 is used. HEAD-probe first so there's no console
@@ -101,18 +105,18 @@ async function loadSession(session) {
   clearLiveRetry();
   showLoading(`Loading ${session.session_name || 'session'}…`);
 
-  // Tear down previous scene objects.
-  if (carMgr) { renderer.remove(carMgr.group); carMgr = null; }
-  if (window.__trackGroup) { renderer.remove(window.__trackGroup); window.__trackGroup = null; }
+  // Tear down previous scene objects, disposing GPU resources to avoid leaks.
+  unfocus();
+  if (carMgr) { carMgr.dispose(); carMgr = null; }
+  if (track) { renderer.remove(track.group); track.dispose && track.dispose(); track = null; }
 
   try {
     store = new SessionStore(session);
     await store.load();
 
     showLoading('Building the circuit from telemetry…');
-    const track = await buildTrack(store);
+    track = await buildTrack(store);
     renderer.add(track.group);
-    window.__trackGroup = track.group;
     renderer.frameTrack(track.centerline);
 
     buffer = new ReplayBuffer(store);
@@ -135,13 +139,16 @@ async function loadSession(session) {
 
     hud = new Hud({
       store, buffer, clock,
-      onSelectDriver: (num) => selectDriver(num),
+      onSelectDriver: (num) => selectDriver(num, true),
     });
-    hud.onFlagChange = (kind) => renderer.setFlagTint(mapFlagTint(kind));
+    hud.onStatusChange = (st) => renderer.setFlagTint(mapStatusTint(st.status));
 
-    // Default selection: pole/leader if available.
-    const firstOrder = hud.orderAt(startMs);
-    if (firstOrder.length) selectDriver(firstOrder[0].num);
+    driverPanel = new DriverPanel({ store });
+    driverPanel.onClose = () => unfocus();
+
+    // Default selection: leader/pole highlighted (no camera focus yet).
+    const firstOrder = store.drivers.length ? [store.drivers[0].driver_number] : [];
+    if (firstOrder.length) selectDriver(firstOrder[0], false);
 
     // Prime the buffer and start playing.
     buffer.update(startMs);
@@ -160,16 +167,62 @@ async function loadSession(session) {
   }
 }
 
-function selectDriver(num) {
+// Select a driver's row (and optionally focus: camera follow + panel + track
+// sector tint). Selecting from the tower focuses; the default startup selection
+// only highlights.
+function selectDriver(num, focus = true) {
   if (carMgr) carMgr.setSelected(num);
   if (hud) hud.setSelected(num);
+  if (focus) focusDriver(num);
 }
 
-function mapFlagTint(kind) {
-  if (!kind) return null;
-  if (kind === 'RED') return 'RED';
-  if (kind === 'CHEQUERED') return null;
-  return 'YELLOW';
+function focusDriver(num) {
+  focused = true;
+  if (driverPanel) driverPanel.show(num);
+  const p = carMgr && carMgr.selectedWorldPos();
+  if (renderer) renderer.setFollow(p || null);
+  const btn = document.getElementById('follow-btn');
+  btn && btn.classList.toggle('active', true);
+}
+
+function unfocus() {
+  focused = false;
+  if (driverPanel) driverPanel.hide();
+  if (renderer) renderer.setFollow(null);
+  if (track && track.sectors) track.sectors.reset();
+  const btn = document.getElementById('follow-btn');
+  btn && btn.classList.remove('active');
+}
+
+function mapStatusTint(status) {
+  if (status === 'RED') return 'RED';
+  if (status === 'YELLOW' || status === 'DOUBLE_YELLOW' || status === 'SC' || status === 'VSC') {
+    return 'YELLOW';
+  }
+  return null; // GREEN / CHEQUERED
+}
+
+// Click-to-focus: a click (not a drag) on a car/label selects+focuses it; a
+// click on empty ground unfocuses.
+function initClickToFocus() {
+  const canvas = document.getElementById('scene');
+  let downX = 0, downY = 0, downT = 0;
+  canvas.addEventListener('pointerdown', (e) => {
+    downX = e.clientX; downY = e.clientY; downT = Date.now();
+  });
+  canvas.addEventListener('pointerup', (e) => {
+    const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
+    if (moved > 6 || Date.now() - downT > 450) return; // was a drag
+    if (!carMgr || !renderer) return;
+    const rect = canvas.getBoundingClientRect();
+    const ndc = {
+      x: ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      y: -((e.clientY - rect.top) / rect.height) * 2 + 1,
+    };
+    const num = carMgr.pick(ndc, renderer.camera);
+    if (num != null) selectDriver(num, true);
+    else unfocus();
+  });
 }
 
 function handleLiveBlock(session) {
@@ -213,7 +266,7 @@ function startLoop() {
       const t = clock.tick(now);
       buffer.update(t);
       const samples = buffer.sampleAll(t);
-      carMgr.update(samples, dt);
+      carMgr.update(samples, dt, t);
 
       // Follow selected driver.
       if (renderer.followEnabled) {
@@ -222,7 +275,18 @@ function startLoop() {
       }
 
       if (hud) hud.render(t);
+      if (driverPanel) driverPanel.update(t);
       if (transport) transport.update();
+
+      // Sector-based track coloring for the focused driver (smooth lerp).
+      if (track && track.sectors) {
+        if (focused && carMgr.selected != null) {
+          const status = store.trackStatusAt(t).status;
+          const colors = focusTrackColors(store.laps, carMgr.selected, t, status);
+          track.sectors.setColors(colors);
+        }
+        track.sectors.tick(0.08);
+      }
     }
 
     renderer.update();
@@ -244,9 +308,11 @@ function toggleFollow() {
   }
 }
 
-// Follow toggle via keyboard 'f' and the corner button.
+// Follow toggle via keyboard 'f' and the corner button; Esc unfocuses.
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'f' && e.target.tagName !== 'INPUT') toggleFollow();
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'f') toggleFollow();
+  else if (e.key === 'Escape') unfocus();
 });
 document.getElementById('follow-btn').addEventListener('click', toggleFollow);
 

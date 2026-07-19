@@ -3,16 +3,21 @@
 // Pipeline:
 //   1. Pick the fastest complete lap (from the SessionStore).
 //   2. Fetch that driver's /location trace spanning the lap.
-//   3. Project to 2D, resample by arc length, smooth (Catmull-Rom), close loop.
-//   4. Build a flat ribbon mesh (~track width) + kerbs on high-curvature
-//      sections + a checkered start/finish line + low outer walls.
-//   5. Return a THREE.Group plus a coordinate transform shared with the cars.
+//   3. Project to 2D, resample by arc length, smooth, close loop (trackMath).
+//   4. Build a flat ribbon (split into 3 sector meshes so a focused driver's
+//      sector colors can be tinted) + kerbs + checkered start/finish + walls.
+//   5. Return a THREE.Group plus a coordinate transform shared with the cars,
+//      and a `sectors` controller for per-sector recoloring.
 //
 // The resampled centerline is cached in localStorage per session_key (tiny).
 
 import * as THREE from 'three';
 import { OpenF1 } from '../api/openf1.js';
-import { catmullRom } from '../engine/interp.js';
+import {
+  resampleByArcLength, smoothClosed, fitTransform, computeNormals,
+  curvature, arcLengths, syntheticOval,
+} from './trackMath.js';
+import { splitSectorsByLength, SECTOR_COLORS } from '../data/sectors.js';
 
 const SCENE_SIZE = 200; // target max horizontal extent of the track in scene units
 const TRACK_WIDTH = 12; // scene units (~ real metres after scaling, roughly)
@@ -31,7 +36,7 @@ export function makeTransform(centerRaw, scale) {
   };
 }
 
-// Main entry. Returns { group, transform, centerline, meta }.
+// Main entry. Returns { group, transform, centerline, sectors, dispose, meta }.
 export async function buildTrack(store) {
   const cached = loadCached(store.sessionKey);
   let centerRaw, meta;
@@ -45,11 +50,10 @@ export async function buildTrack(store) {
     saveCached(store.sessionKey, { centerline: centerRaw, meta });
   }
 
-  // Compute transform (center + scale) from the raw centerline bbox.
-  const { center, scale } = fitTransform(centerRaw);
+  const { center, scale } = fitTransform(centerRaw, SCENE_SIZE);
   const transform = makeTransform(center, scale);
 
-  // Scene-space centerline.
+  // Scene-space centerline as THREE.Vector2.
   const pts = centerRaw.map((p) => {
     const s = transform.toScene(p.x, p.y);
     return new THREE.Vector2(s.x, s.z);
@@ -57,20 +61,29 @@ export async function buildTrack(store) {
 
   const group = new THREE.Group();
   group.name = 'track';
+  const disposables = [];
 
-  const { ribbon, normals, cumLen, totalLen } = buildRibbon(pts, TRACK_WIDTH);
-  group.add(ribbon);
-  group.add(buildKerbs(pts, normals, TRACK_WIDTH));
-  group.add(buildWalls(pts, normals, TRACK_WIDTH));
-  const sf = buildStartFinish(pts, normals, TRACK_WIDTH, meta.startIndex || 0);
+  const normals = computeNormals(pts.map((v) => ({ x: v.x, y: v.y })));
+  const { cumLen, totalLen } = arcLengths(pts.map((v) => ({ x: v.x, y: v.y })));
+  const sectorRanges = splitSectorsByLength(cumLen, totalLen);
+
+  const { group: ribbonGroup, sectors } = buildSectorRibbon(pts, normals, TRACK_WIDTH, sectorRanges, disposables);
+  group.add(ribbonGroup);
+  group.add(buildKerbs(pts, normals, TRACK_WIDTH, disposables));
+  group.add(buildWalls(pts, normals, TRACK_WIDTH, disposables));
+  const sf = buildStartFinish(pts, normals, TRACK_WIDTH, meta.startIndex || 0, disposables);
   group.add(sf.group);
+
+  const dispose = () => disposeTrack(group, disposables);
 
   return {
     group,
     transform,
     centerline: pts, // Vector2 in scene space
     startFinish: sf.start,
-    meta: { ...meta, totalLen, scale },
+    sectors, // { setColors(['purple',...], lerp?), reset() }
+    dispose,
+    meta: { ...meta, totalLen, scale, sectorRanges },
   };
 }
 
@@ -79,13 +92,11 @@ export async function buildTrack(store) {
 async function deriveCenterlineFromData(store) {
   const lap = store.fastestLap();
   if (!lap) {
-    // No usable lap → synthesize a generic oval so the app still renders.
     return { centerline: syntheticOval(), meta: { synthetic: true, startIndex: 0 } };
   }
   const driver = lap.driver_number;
   const t0 = Date.parse(lap.date_start);
   const dur = (lap.lap_duration || 100) * 1000;
-  // Pad the window a little each side.
   const startISO = new Date(t0 - 3000).toISOString();
   const endISO = new Date(t0 + dur + 3000).toISOString();
 
@@ -113,169 +124,95 @@ async function deriveCenterlineFromData(store) {
   return { centerline: smooth, meta: { synthetic: false, startIndex: 0, driver } };
 }
 
-// Resample a polyline to N points evenly spaced by arc length, closing the loop.
-function resampleByArcLength(trace, n) {
-  const pts = trace.map((p) => ({ x: p.x, y: p.y }));
-  // Ensure the loop is closed: append the first point if far from the last.
-  const first = pts[0], last = pts[pts.length - 1];
-  const gap = Math.hypot(last.x - first.x, last.y - first.y);
-  const seg = totalPerimeter(pts) / pts.length;
-  if (gap > seg * 3) pts.push({ x: first.x, y: first.y });
-
-  const cum = [0];
-  for (let i = 1; i < pts.length; i++) {
-    cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
-  }
-  const total = cum[cum.length - 1];
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const d = (i / n) * total;
-    let j = 1;
-    while (j < cum.length && cum[j] < d) j++;
-    j = Math.min(j, cum.length - 1);
-    const segLen = cum[j] - cum[j - 1] || 1;
-    const u = (d - cum[j - 1]) / segLen;
-    out.push({
-      x: pts[j - 1].x + (pts[j].x - pts[j - 1].x) * u,
-      y: pts[j - 1].y + (pts[j].y - pts[j - 1].y) * u,
-    });
-  }
-  return out;
-}
-
-// Catmull-Rom smoothing over a closed loop, `passes` times.
-function smoothClosed(pts, passes) {
-  let cur = pts;
-  for (let p = 0; p < passes; p++) {
-    const n = cur.length;
-    const out = new Array(n);
-    for (let i = 0; i < n; i++) {
-      const p0 = cur[(i - 1 + n) % n];
-      const p1 = cur[i];
-      const p2 = cur[(i + 1) % n];
-      const p3 = cur[(i + 2) % n];
-      out[i] = {
-        x: catmullRom(p0.x, p1.x, p2.x, p3.x, 0.5),
-        y: catmullRom(p0.y, p1.y, p2.y, p3.y, 0.5),
-      };
-    }
-    cur = out;
-  }
-  return cur;
-}
-
-function totalPerimeter(pts) {
-  let s = 0;
-  for (let i = 1; i < pts.length; i++) s += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-  return s || 1;
-}
-
-function fitTransform(centerRaw) {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of centerRaw) {
-    if (p.x < minX) minX = p.x;
-    if (p.y < minY) minY = p.y;
-    if (p.x > maxX) maxX = p.x;
-    if (p.y > maxY) maxY = p.y;
-  }
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  const extent = Math.max(maxX - minX, maxY - minY) || 1;
-  const scale = SCENE_SIZE / extent;
-  return { center: { x: cx, y: cy }, scale };
-}
-
 // --- geometry builders (scene space) ---------------------------------------
 
-// Compute per-point outward normals for a closed centerline.
-function computeNormals(pts) {
+// Build the ribbon split into 3 sector meshes so each sector can be tinted.
+// Returns { group, sectors } where sectors exposes setColors/reset for the
+// focus-mode sector coloring (with smooth lerp toward targets).
+function buildSectorRibbon(pts, normals, width, sectorRanges, disposables) {
   const n = pts.length;
-  const normals = new Array(n);
-  for (let i = 0; i < n; i++) {
-    const prev = pts[(i - 1 + n) % n];
-    const next = pts[(i + 1) % n];
-    const tx = next.x - prev.x;
-    const ty = next.y - prev.y;
-    const len = Math.hypot(tx, ty) || 1;
-    // Left normal of the tangent.
-    normals[i] = new THREE.Vector2(-ty / len, tx / len);
-  }
-  return normals;
-}
-
-function buildRibbon(pts, width) {
-  const n = pts.length;
-  const normals = computeNormals(pts);
   const half = width / 2;
-  const positions = [];
-  const uvs = [];
-  const cumLen = [0];
-  for (let i = 1; i < n; i++) {
-    cumLen.push(cumLen[i - 1] + pts[i].distanceTo(pts[i - 1]));
-  }
-  const totalLen = cumLen[n - 1] + pts[0].distanceTo(pts[n - 1]);
-
-  // Two vertices per station (left/right), y slightly above ground.
   const Y = 0.05;
-  for (let i = 0; i <= n; i++) {
-    const idx = i % n;
-    const p = pts[idx];
-    const nm = normals[idx];
-    const l = { x: p.x + nm.x * half, z: p.y + nm.y * half };
-    const r = { x: p.x - nm.x * half, z: p.y - nm.y * half };
-    positions.push(l.x, Y, l.z, r.x, Y, r.z);
-    const v = (i / n);
-    uvs.push(0, v, 1, v);
-  }
-  const indices = [];
-  for (let i = 0; i < n; i++) {
-    const a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, d = (i + 1) * 2 + 1;
-    indices.push(a, c, b, b, c, d);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-  geo.setIndex(indices);
-  geo.computeVertexNormals();
+  const group = new THREE.Group();
+  group.name = 'ribbon';
 
-  const mat = new THREE.MeshStandardMaterial({
-    color: 0x2b2f36,
-    roughness: 0.95,
-    metalness: 0.0,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.receiveShadow = true;
-  mesh.name = 'ribbon';
-  return { ribbon: mesh, normals, cumLen, totalLen };
+  const meshes = [];
+  const materials = [];
+  for (let sec = 0; sec < 3; sec++) {
+    const [a, b] = sectorRanges[sec];
+    const positions = [];
+    const indices = [];
+    let vi = 0;
+    for (let i = a; i < b; i++) {
+      const i0 = i % n;
+      const i1 = (i + 1) % n;
+      const p0 = pts[i0], p1 = pts[i1];
+      const nm0 = normals[i0], nm1 = normals[i1];
+      const l0 = { x: p0.x + nm0.x * half, z: p0.y + nm0.y * half };
+      const r0 = { x: p0.x - nm0.x * half, z: p0.y - nm0.y * half };
+      const l1 = { x: p1.x + nm1.x * half, z: p1.y + nm1.y * half };
+      const r1 = { x: p1.x - nm1.x * half, z: p1.y - nm1.y * half };
+      positions.push(l0.x, Y, l0.z, r0.x, Y, r0.z, l1.x, Y, l1.z, r1.x, Y, r1.z);
+      indices.push(vi, vi + 2, vi + 1, vi + 1, vi + 2, vi + 3);
+      vi += 4;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({
+      color: SECTOR_COLORS.none, roughness: 0.95, metalness: 0.0,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.receiveShadow = true;
+    mesh.name = `ribbon-sector-${sec}`;
+    group.add(mesh);
+    meshes.push(mesh);
+    materials.push(mat);
+    disposables.push(geo, mat);
+  }
+
+  // Sector coloring controller with per-frame lerp toward target colors.
+  const targets = [
+    new THREE.Color(SECTOR_COLORS.none),
+    new THREE.Color(SECTOR_COLORS.none),
+    new THREE.Color(SECTOR_COLORS.none),
+  ];
+  const sectors = {
+    setColors(colorNames) {
+      for (let i = 0; i < 3; i++) {
+        const hex = SECTOR_COLORS[colorNames[i]] ?? SECTOR_COLORS.none;
+        targets[i].setHex(hex);
+      }
+    },
+    reset() {
+      this.setColors(['none', 'none', 'none']);
+    },
+    // Call each frame; lerp material colors toward targets for smooth transitions.
+    tick(alpha = 0.08) {
+      for (let i = 0; i < 3; i++) materials[i].color.lerp(targets[i], alpha);
+    },
+  };
+
+  return { group, sectors };
 }
 
-// Kerbs: red/white alternating strips on the outer & inner edges of
-// high-curvature sections.
-function buildKerbs(pts, normals, width) {
+// Kerbs: red/white alternating strips on high-curvature sections.
+function buildKerbs(pts, normals, width, disposables) {
   const n = pts.length;
   const half = width / 2;
   const kerbW = 1.6;
   const group = new THREE.Group();
   group.name = 'kerbs';
 
-  // Curvature estimate via turning angle.
-  const curv = new Array(n);
-  for (let i = 0; i < n; i++) {
-    const a = pts[(i - 1 + n) % n];
-    const b = pts[i];
-    const c = pts[(i + 1) % n];
-    const v1 = new THREE.Vector2(b.x - a.x, b.y - a.y);
-    const v2 = new THREE.Vector2(c.x - b.x, c.y - b.y);
-    const ang = Math.abs(signedAngle(v1, v2));
-    curv[i] = ang;
-  }
+  const curv = curvature(pts.map((v) => ({ x: v.x, y: v.y })));
   const maxCurv = Math.max(...curv, 0.0001);
   const thresh = Math.max(0.03, maxCurv * 0.28);
 
   const redMat = new THREE.MeshStandardMaterial({ color: 0xd21b1b, roughness: 0.7 });
   const whiteMat = new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.7 });
+  disposables.push(redMat, whiteMat);
 
-  let stripe = 0;
   for (let side = -1; side <= 1; side += 2) {
     const positions = { red: [], white: [] };
     for (let i = 0; i < n; i++) {
@@ -294,19 +231,20 @@ function buildKerbs(pts, normals, width) {
       tgt.push(a.x, Y, a.z, c.x, Y, c.z, b.x, Y, b.z);
       tgt.push(b.x, Y, b.z, c.x, Y, c.z, d.x, Y, d.z);
     }
-    group.add(triMesh(positions.red, redMat));
-    group.add(triMesh(positions.white, whiteMat));
+    group.add(triMesh(positions.red, redMat, disposables));
+    group.add(triMesh(positions.white, whiteMat, disposables));
   }
   return group;
 }
 
-function buildWalls(pts, normals, width) {
+function buildWalls(pts, normals, width, disposables) {
   const n = pts.length;
   const half = width / 2 + 2.5;
   const wallH = 1.4;
   const group = new THREE.Group();
   group.name = 'walls';
   const mat = new THREE.MeshStandardMaterial({ color: 0x9aa3ad, roughness: 0.8, side: THREE.DoubleSide });
+  disposables.push(mat);
   for (let side = -1; side <= 1; side += 2) {
     const positions = [];
     for (let i = 0; i <= n; i++) {
@@ -326,14 +264,14 @@ function buildWalls(pts, normals, width) {
     geo.setIndex(indices);
     geo.computeVertexNormals();
     const mesh = new THREE.Mesh(geo, mat);
-    mesh.castShadow = false;
     mesh.receiveShadow = true;
     group.add(mesh);
+    disposables.push(geo);
   }
   return group;
 }
 
-function buildStartFinish(pts, normals, width, startIndex) {
+function buildStartFinish(pts, normals, width, startIndex, disposables) {
   const group = new THREE.Group();
   group.name = 'startfinish';
   const i = startIndex % pts.length;
@@ -341,7 +279,6 @@ function buildStartFinish(pts, normals, width, startIndex) {
   const nm = normals[i];
   const half = width / 2;
   const depth = 2.2;
-  // Tangent direction.
   const i2 = (i + 1) % pts.length;
   const tx = pts[i2].x - p.x, tz = pts[i2].y - p.y;
   const tlen = Math.hypot(tx, tz) || 1;
@@ -349,11 +286,12 @@ function buildStartFinish(pts, normals, width, startIndex) {
 
   const cols = 8;
   const rows = 4;
-  const cellW = (width) / cols;
+  const cellW = width / cols;
   const cellD = depth / rows;
   const Y = 0.09;
   const black = new THREE.MeshStandardMaterial({ color: 0x111417, roughness: 0.6 });
   const white = new THREE.MeshStandardMaterial({ color: 0xf5f5f5, roughness: 0.6 });
+  disposables.push(black, white);
   const baseX = p.x + nm.x * half - tux * (depth / 2);
   const baseZ = p.y + nm.y * half - tuz * (depth / 2);
   for (let c = 0; c < cols; c++) {
@@ -367,6 +305,7 @@ function buildStartFinish(pts, normals, width, startIndex) {
       mesh.position.set(acx + nm.x * cellW / 2, Y, acz + nm.y * cellW / 2);
       mesh.rotation.z = Math.atan2(tuz, tux);
       group.add(mesh);
+      disposables.push(geo);
     }
   }
   return { start: p, group };
@@ -374,30 +313,28 @@ function buildStartFinish(pts, normals, width, startIndex) {
 
 // --- helpers ---------------------------------------------------------------
 
-function triMesh(positions, mat) {
+function triMesh(positions, mat, disposables) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.computeVertexNormals();
   const m = new THREE.Mesh(geo, mat);
   m.receiveShadow = true;
+  disposables.push(geo);
   return m;
 }
 
-function signedAngle(v1, v2) {
-  const dot = v1.x * v2.x + v1.y * v2.y;
-  const det = v1.x * v2.y - v1.y * v2.x;
-  return Math.atan2(det, dot);
-}
-
-function syntheticOval() {
-  const pts = [];
-  const N = 400;
-  const a = 8000, b = 5000;
-  for (let i = 0; i < N; i++) {
-    const th = (i / N) * Math.PI * 2;
-    pts.push({ x: a * Math.cos(th), y: b * Math.sin(th) * (0.7 + 0.3 * Math.cos(th * 2)) });
+// Dispose all geometries/materials so switching sessions doesn't leak GPU memory.
+export function disposeTrack(group, disposables) {
+  if (disposables) {
+    for (const d of disposables) { try { d.dispose && d.dispose(); } catch { /* ignore */ } }
   }
-  return pts;
+  group.traverse((o) => {
+    if (o.geometry && o.geometry.dispose) o.geometry.dispose();
+    if (o.material) {
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats) { if (m && m.dispose) m.dispose(); }
+    }
+  });
 }
 
 // --- localStorage cache ----------------------------------------------------
@@ -417,6 +354,3 @@ function saveCached(sessionKey, data) {
     localStorage.setItem(LS_KEY(sessionKey), JSON.stringify(data));
   } catch { /* ignore */ }
 }
-
-// buildStartFinish returns {start, group}; buildTrack expects .group added. Fix
-// by normalizing here since we used it inline above.

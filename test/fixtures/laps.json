@@ -1,0 +1,7 @@
+[
+  { "driver_number": 44, "lap_number": 1, "is_pit_out_lap": true, "lap_duration": 110.0, "date_start": "2025-07-01T13:00:10.000Z", "duration_sector_1": 35.0, "duration_sector_2": 38.0, "duration_sector_3": 37.0 },
+  { "driver_number": 44, "lap_number": 2, "is_pit_out_lap": false, "lap_duration": 96.584, "date_start": "2025-07-01T13:02:00.000Z", "duration_sector_1": 30.200, "duration_sector_2": 33.400, "duration_sector_3": 32.984 },
+  { "driver_number": 44, "lap_number": 3, "is_pit_out_lap": false, "lap_duration": 95.984, "date_start": "2025-07-01T13:03:37.000Z", "duration_sector_1": 29.900, "duration_sector_2": 33.100, "duration_sector_3": 32.984 },
+  { "driver_number": 1, "lap_number": 2, "is_pit_out_lap": false, "lap_duration": 96.918, "date_start": "2025-07-01T13:02:10.000Z", "duration_sector_1": 30.500, "duration_sector_2": 33.500, "duration_sector_3": 32.918 },
+  { "driver_number": 16, "lap_number": 2, "is_pit_out_lap": false, "lap_duration": 96.500, "date_start": "2025-07-01T13:03:00.000Z", "duration_sector_1": 30.000, "duration_sector_2": 33.300, "duration_sector_3": 33.200 }
+]

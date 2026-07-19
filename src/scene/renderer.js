@@ -192,9 +192,8 @@ export class IsoRenderer {
     const worldForward = new THREE.Vector3();
 
     const updateBasis = () => {
-      // Screen-right and screen-"down" projected onto ground plane.
-      worldRight.set(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), 0);
-      // Derive from camera orientation.
+      // Screen-right and screen-"up" projected onto the ground plane, derived
+      // from the camera orientation.
       this.camera.updateMatrixWorld();
       const r = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 0);
       const u = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 1);

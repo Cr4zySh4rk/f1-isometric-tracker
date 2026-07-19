@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist_stale_*/
 .DS_Store
 *.log
 # Vite writes transient config timestamp files during build

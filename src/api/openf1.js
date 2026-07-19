@@ -8,6 +8,8 @@
 //  - In-memory response cache keyed by full URL.
 //  - Optional paid API key (Authorization: Bearer) read from settings.
 
+import { RateLimitedQueue, classifyResponse } from './queue.js';
+
 const BASE = 'https://api.openf1.org/v1';
 
 // --- error types -----------------------------------------------------------
@@ -51,91 +53,15 @@ export function setApiKey(key) {
 
 // --- throttled queue -------------------------------------------------------
 
-const MAX_PER_SEC = 3;
-const MAX_PER_MIN = 30;
-
-const state = {
-  queue: [],
-  running: false,
-  secWindow: [], // timestamps of requests in the last 1s
-  minWindow: [], // timestamps of requests in the last 60s
-  pausedUntil: 0, // epoch ms; queue paused (e.g. after 429) until this time
-  listeners: new Set(),
-};
+const queue = new RateLimitedQueue({ perSec: 3, perMin: 30 });
 
 // Observers can watch queue depth / pause state (used by a subtle UI indicator).
 export function onQueueChange(fn) {
-  state.listeners.add(fn);
-  return () => state.listeners.delete(fn);
-}
-function emit() {
-  const info = { depth: state.queue.length, paused: Date.now() < state.pausedUntil };
-  for (const fn of state.listeners) {
-    try { fn(info); } catch { /* ignore */ }
-  }
-}
-
-function prune(now) {
-  state.secWindow = state.secWindow.filter((t) => now - t < 1000);
-  state.minWindow = state.minWindow.filter((t) => now - t < 60000);
-}
-
-// How long until we're allowed to send the next request.
-function nextSlotDelay(now) {
-  if (now < state.pausedUntil) return state.pausedUntil - now;
-  prune(now);
-  let delay = 0;
-  if (state.secWindow.length >= MAX_PER_SEC) {
-    delay = Math.max(delay, 1000 - (now - state.secWindow[0]));
-  }
-  if (state.minWindow.length >= MAX_PER_MIN) {
-    delay = Math.max(delay, 60000 - (now - state.minWindow[0]));
-  }
-  return delay;
-}
-
-async function pump() {
-  if (state.running) return;
-  state.running = true;
-  while (state.queue.length) {
-    const now = Date.now();
-    const delay = nextSlotDelay(now);
-    if (delay > 0) {
-      await sleep(delay);
-      continue;
-    }
-    const job = state.queue.shift();
-    emit();
-    const ts = Date.now();
-    state.secWindow.push(ts);
-    state.minWindow.push(ts);
-    try {
-      const result = await job.run();
-      job.resolve(result);
-    } catch (err) {
-      if (err && err.__retry429) {
-        // Re-queue at the front and pause the whole queue.
-        state.pausedUntil = Date.now() + err.__retry429;
-        state.queue.unshift(job);
-        emit();
-      } else {
-        job.reject(err);
-      }
-    }
-  }
-  state.running = false;
+  return queue.onChange(fn);
 }
 
 function enqueue(run) {
-  return new Promise((resolve, reject) => {
-    state.queue.push({ run, resolve, reject });
-    emit();
-    pump();
-  });
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  return queue.enqueue(run);
 }
 
 // --- cache -----------------------------------------------------------------
@@ -160,33 +86,26 @@ async function doFetch(url) {
     throw new ApiError(`Network error: ${netErr.message}`, 0);
   }
 
-  if (res.status === 429) {
-    const retryAfter = parseFloat(res.headers.get('Retry-After')) || 5;
-    const e = new Error('rate limited');
-    e.__retry429 = Math.max(1000, retryAfter * 1000);
-    throw e;
-  }
-
-  const text = await res.text();
+  const text = res.status === 429 ? '' : await res.text();
   let body = null;
   if (text) {
     try { body = JSON.parse(text); } catch { body = text; }
   }
 
-  // Live-block: a 4xx whose JSON detail mentions the live restriction.
-  const detail = body && typeof body === 'object' && !Array.isArray(body) ? body.detail : null;
-  if (detail && /live f1 session/i.test(String(detail))) {
-    throw new LiveBlockError(detail);
+  const decision = classifyResponse(res.status, body, res.headers.get('Retry-After'));
+  switch (decision.kind) {
+    case 'retry429': {
+      const e = new Error('rate limited');
+      e.__retry429 = decision.retryMs; // queue pauses & re-queues on this
+      throw e;
+    }
+    case 'liveblock':
+      throw new LiveBlockError(decision.detail);
+    case 'error':
+      throw new ApiError(decision.message, decision.status);
+    default:
+      return decision.body;
   }
-
-  if (!res.ok) {
-    throw new ApiError(
-      typeof detail === 'string' ? detail : `Request failed (${res.status})`,
-      res.status
-    );
-  }
-
-  return body;
 }
 
 // --- public request helper -------------------------------------------------
@@ -249,6 +168,7 @@ export const OpenF1 = {
   laps: (session_key) => api('laps', { session_key }),
   position: (session_key) => api('position', { session_key }),
   raceControl: (session_key) => api('race_control', { session_key }),
+  pit: (session_key) => api('pit', { session_key }),
   sessionResult: (session_key) => api('session_result', { session_key }),
   // Windowed requests: not URL-cached — the ReplayBuffer owns eviction, so
   // caching raw JSON here would duplicate memory and grow unbounded.

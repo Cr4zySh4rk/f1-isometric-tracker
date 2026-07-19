@@ -174,6 +174,133 @@ html, body {
 .lb-gap { color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: 12px; text-align: right; }
 .lb-last { color: #cfd6e0; font-variant-numeric: tabular-nums; font-size: 11px; text-align: right; }
 
+/* ---------- Timing tower (F1 TV style) ---------- */
+.leaderboard.tower { width: 288px; padding: 0; overflow: hidden; }
+.tower .tw-header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: linear-gradient(180deg, rgba(20,24,32,0.96), rgba(16,20,28,0.9));
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.tw-mark {
+  background: var(--red); color: #fff; font-weight: 900;
+  padding: 3px 8px; border-radius: 5px; font-size: 15px; font-family: var(--font-cond);
+}
+.tw-session {
+  font-family: var(--font-cond); font-weight: 800; font-size: 17px;
+  letter-spacing: 1px; text-transform: uppercase;
+}
+.tw-clock {
+  font-variant-numeric: tabular-nums; font-size: 14px; color: var(--text-dim);
+  font-weight: 700; letter-spacing: 0.5px;
+}
+.tw-status {
+  padding: 5px 12px; font-family: var(--font-cond); font-weight: 800;
+  font-size: 13px; letter-spacing: 2px; text-transform: uppercase; text-align: center;
+  color: #05210f;
+}
+.tw-status-green { background: #16c060; color: #04240f; }
+.tw-status-yellow, .tw-status-double-yellow { background: var(--yellow); color: #241c00; }
+.tw-status-sc, .tw-status-vsc { background: #ffcf33; color: #241c00; }
+.tw-status-red { background: var(--red); color: #fff; }
+.tw-status-chequered {
+  color: #111;
+  background: repeating-conic-gradient(#fff 0 90deg, #111 0 180deg) 0 0 / 14px 14px;
+  text-shadow: 0 0 3px #fff, 0 0 3px #fff;
+}
+.tw-pulse { animation: flagpulse 1.1s ease-in-out infinite; }
+
+.tw-rows { max-height: calc(100vh - 210px); overflow-y: auto; padding: 4px; scrollbar-width: thin; }
+.tw-rows::-webkit-scrollbar { width: 6px; }
+.tw-rows::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
+.tw-row {
+  display: grid;
+  grid-template-columns: 20px 14px 5px 42px 1fr auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+  border-left: 3px solid transparent;
+  transition: background 0.12s;
+}
+.tw-row:hover { background: rgba(255,255,255,0.05); }
+.tw-selected { background: rgba(225,6,0,0.16); border-left-color: var(--red); }
+.tw-fl { box-shadow: inset 0 0 0 1px rgba(139,63,251,0.55); }
+.tw-inpit { opacity: 0.72; }
+.tw-pos { font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+.tw-arrow { font-size: 10px; text-align: center; }
+.tw-arrow-up { color: #37d67a; }
+.tw-arrow-down { color: #ff5a4a; }
+.tw-arrow-same { color: var(--text-dim); }
+.tw-bar { width: 5px; height: 20px; border-radius: 3px; }
+.tw-acr { font-family: var(--font-cond); font-weight: 800; letter-spacing: 0.5px; font-size: 15px; }
+.tw-badges { display: flex; gap: 3px; }
+.tw-badge {
+  font-size: 9px; font-weight: 800; padding: 1px 4px; border-radius: 3px;
+  letter-spacing: 0.5px; line-height: 1.4;
+}
+.tw-badge-fl { background: #8b3ffb; color: #fff; }
+.tw-badge-pit { background: #2f78ff; color: #fff; }
+.tw-badge-pen { background: #ff5a1f; color: #fff; }
+.tw-delta { font-variant-numeric: tabular-nums; font-size: 12px; text-align: right; color: #cfd6e0; }
+.tw-delta-leader { color: #8fe3ff; font-weight: 800; font-size: 11px; letter-spacing: 1px; }
+.tw-delta-notime { color: var(--text-dim); font-size: 11px; letter-spacing: 0.5px; }
+.tw-delta-best { color: #fff; font-weight: 700; }
+.tw-fl .tw-delta-best, .tw-fl .tw-acr { color: #c9a5ff; }
+
+/* ---------- Driver panel ---------- */
+.driver-panel {
+  position: absolute;
+  right: 16px;
+  bottom: 84px;
+  width: 260px;
+  z-index: 18;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  font-size: 13px;
+}
+.dp-head {
+  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px;
+  padding: 10px 12px; border-left: 4px solid #888;
+  background: rgba(255,255,255,0.03);
+}
+.dp-num { font-family: var(--font-cond); font-weight: 900; font-size: 26px; }
+.dp-name { font-weight: 800; font-size: 14px; }
+.dp-team { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.dp-close { background: none; border: none; color: var(--text-dim); font-size: 22px; cursor: pointer; line-height: 1; }
+.dp-close:hover { color: var(--text); }
+.dp-grid { display: flex; gap: 8px; padding: 8px 12px 0; }
+.dp-cell {
+  flex: 1; display: flex; flex-direction: column; gap: 2px;
+  background: rgba(255,255,255,0.03); border-radius: 8px; padding: 6px 8px;
+}
+.dp-k { color: var(--text-dim); font-size: 10px; letter-spacing: 1px; }
+.dp-v { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 14px; }
+.dp-live { color: #8fe3ff; }
+.dp-sectors { display: flex; gap: 6px; padding: 10px 12px 12px; }
+.dp-sec {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  border-radius: 8px; padding: 6px 4px; background: rgba(255,255,255,0.04);
+  border-top: 3px solid transparent;
+}
+.dp-sec-k { font-size: 10px; color: var(--text-dim); letter-spacing: 1px; }
+.dp-sec-v { font-variant-numeric: tabular-nums; font-size: 12px; font-weight: 700; }
+.dp-sec-purple { border-top-color: #8b3ffb; } .dp-sec-purple .dp-sec-v { color: #c9a5ff; }
+.dp-sec-green { border-top-color: #37d67a; } .dp-sec-green .dp-sec-v { color: #7fe6ab; }
+.dp-sec-yellow { border-top-color: #ffd23a; } .dp-sec-yellow .dp-sec-v { color: #ffe08a; }
+.dp-sec-red { border-top-color: #e1301f; } .dp-sec-red .dp-sec-v { color: #ff9a8f; }
+.dp-sec-none .dp-sec-v { color: var(--text-dim); }
+
 /* ---------- Global banner ---------- */
 .banner {
   position: absolute;
@@ -478,6 +605,9 @@ html, body {
 /* ---------- Responsive ---------- */
 @media (max-width: 720px) {
   .leaderboard { width: 190px; top: 64px; left: 10px; font-size: 12px; }
+  .leaderboard.tower { width: 210px; }
+  .tw-row { grid-template-columns: 18px 12px 5px 38px 1fr auto; gap: 5px; }
+  .driver-panel { width: 200px; bottom: 78px; right: 8px; }
   .lb-row { grid-template-columns: 18px 5px 40px 1fr; }
   .lb-last { display: none; }
   .transport { width: calc(100vw - 20px); gap: 8px; padding: 8px 12px; }

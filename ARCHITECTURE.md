@@ -83,7 +83,55 @@ until data appears.
   `actions/deploy-pages`.
 - 100% static; the browser talks to OpenF1 directly (CORS is open).
 
-## 5. Failure modes handled
+## 5. V2 — timing tower, focus mode & sector coloring
+
+Everything below is **replay-time-aware**: state is computed as of session time
+T, never end-of-session. The timing/parse logic lives in pure, unit-tested
+modules (no DOM) so it can be validated in node against fixtures:
+
+```
+src/util/format.js      lap/delta/interval/clock/live-lap formatting
+src/data/raceControl.js flag + SC/VSC state, penalty parsing (all at time T)
+src/data/timing.js      fastest-lap-at-T, order, deltas, pit, sector bests,
+                        buildTowerRows() model, focusTrackColors()
+src/data/sectors.js     sector-color state machine + centerline sector split
+src/track/trackMath.js  resample/smooth/normals/curvature/arc-length (no three)
+src/api/queue.js        RateLimitedQueue (injectable clock) + classifyResponse
+```
+
+- **Timing tower** (`ui/hud.js`) renders `buildTowerRows()`: position, ▲/▼ change
+  vs grid, team bar, acronym, delta column, and P / penalty / FL badges. Races
+  show LEADER + interval (click the header to toggle interval ↔ gap-to-leader);
+  practice/quali show P1's best time, "+Δ" to P1, or NO TIME. A status strip
+  (green/yellow/double-yellow/red/SC/VSC/chequered, pulsing for red & SC)
+  reflects `/race_control`.
+- **Fastest lap**: purple FL marker on the current session-fastest-lap holder,
+  recomputed at T (`fastestLapAt` only counts laps *completed* before T).
+- **Penalties**: parsed from `/race_control` messages ("N SECOND … CAR X" →
+  "+Ns", "STOP/GO" → SG, "DRIVE THROUGH" → DT); shown as a badge with the full
+  message as tooltip.
+- **Pit detection** (`isInPitAt`): a driver is "in pit" when T falls in
+  `[exit − pit_duration − 4s, exit + 4s]` from a `/pit` row (OpenF1's pit `date`
+  is the rejoin time). Robust without needing location gaps.
+- **Floating car labels** (`scene/cars.js`): acronym + live current-lap time
+  (T − current lap's `date_start`), scaled with camera zoom; the lap time hides
+  when zoomed far out.
+- **Click-to-focus** (`scene/cars.js` raycast + `main.js`): clicking a car/label
+  selects it → camera follows, tower row highlights, and the driver panel
+  (`ui/driverPanel.js`) shows name/team/number/position, current lap & live
+  time, last/best lap, and S1/S2/S3 colored purple (session best) / green
+  (personal best) / yellow / red. Click empty ground or press Esc to unfocus.
+- **Sector track coloring**: the ribbon is split into 3 meshes. Sector
+  boundaries are **equal thirds of the centerline arc length**
+  (`splitSectorsByLength`, default proportions — pass session-typical sector
+  time proportions to weight them). Each sector is tinted by the focused
+  driver's most recent completed sector: purple = session best, green = personal
+  best, yellow = slower, red = >2 s slower. A red/yellow/SC/VSC track status
+  overrides the whole track (flag takes priority). Colors lerp smoothly.
+- **Memory**: switching sessions disposes all track and car geometries /
+  materials / textures (`track.dispose()`, `carMgr.dispose()`).
+
+## 6. Failure modes handled
 
 - Live-block error → banner + backoff retry (no crash, UI stays interactive).
 - 429 → queue pauses, resumes after window.

@@ -1,0 +1,7 @@
+[
+  { "driver_number": 1, "gap_to_leader": null, "interval": null, "date": "2025-07-01T13:14:00.000Z" },
+  { "driver_number": 44, "gap_to_leader": 0, "interval": 0, "date": "2025-07-01T13:15:00.000Z" },
+  { "driver_number": 1, "gap_to_leader": 0.334, "interval": 0.334, "date": "2025-07-01T13:15:00.000Z" },
+  { "driver_number": 16, "gap_to_leader": 1.534, "interval": 1.200, "date": "2025-07-01T13:15:00.000Z" },
+  { "driver_number": 4, "gap_to_leader": "+1 LAP", "interval": "+1 LAP", "date": "2025-07-01T13:15:00.000Z" }
+]

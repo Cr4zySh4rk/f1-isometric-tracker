@@ -1,0 +1,16 @@
+[
+  { "category": "Flag", "flag": "GREEN", "message": "GREEN LIGHT - PIT EXIT OPEN", "date": "2025-07-01T13:00:00.000Z" },
+  { "category": "Flag", "flag": "YELLOW", "message": "YELLOW IN TRACK SECTOR 5", "date": "2025-07-01T13:05:00.000Z" },
+  { "category": "Flag", "flag": "DOUBLE YELLOW", "message": "DOUBLE YELLOW IN TRACK SECTOR 5", "date": "2025-07-01T13:06:00.000Z" },
+  { "category": "Flag", "flag": "GREEN", "message": "GREEN LIGHT - TRACK CLEAR", "date": "2025-07-01T13:07:00.000Z" },
+  { "category": "SafetyCar", "message": "SAFETY CAR DEPLOYED", "date": "2025-07-01T13:10:00.000Z" },
+  { "category": "SafetyCar", "message": "SAFETY CAR IN THIS LAP", "date": "2025-07-01T13:12:00.000Z" },
+  { "category": "Flag", "flag": "GREEN", "message": "GREEN LIGHT - TRACK CLEAR", "date": "2025-07-01T13:12:30.000Z" },
+  { "category": "SafetyCar", "message": "VIRTUAL SAFETY CAR DEPLOYED", "date": "2025-07-01T13:20:00.000Z" },
+  { "category": "SafetyCar", "message": "VIRTUAL SAFETY CAR ENDING", "date": "2025-07-01T13:21:00.000Z" },
+  { "category": "Other", "message": "5 SECOND TIME PENALTY FOR CAR 44 (HAM) - TRACK LIMITS", "date": "2025-07-01T13:25:00.000Z" },
+  { "category": "Other", "message": "10 SECOND STOP/GO PENALTY FOR CAR 1 (VER) - UNSAFE RELEASE", "date": "2025-07-01T13:26:00.000Z" },
+  { "category": "Other", "message": "DRIVE THROUGH PENALTY FOR CAR 16 (LEC) - SPEEDING IN PIT LANE", "date": "2025-07-01T13:27:00.000Z" },
+  { "category": "Flag", "flag": "RED", "message": "RED FLAG", "date": "2025-07-01T13:40:00.000Z" },
+  { "category": "Flag", "flag": "CHEQUERED", "message": "CHEQUERED FLAG", "date": "2025-07-01T13:55:00.000Z" }
+]

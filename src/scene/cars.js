@@ -7,8 +7,13 @@
 // along their velocity and fade out when telemetry drops (pits/garage).
 
 import * as THREE from 'three';
+import { inProgressLap } from '../data/timing.js';
+import { fmtLiveLap } from '../util/format.js';
 
 const CAR_SCALE = 3.2; // scene units for car length-ish
+// Above this zoomed-out frustum size, hide the ticking lap time to reduce
+// clutter (acronym stays).
+const LAPTIME_HIDE_FRUSTUM = 320;
 let sharedGLTF = null; // loaded template, if any
 
 export class CarManager {
@@ -21,6 +26,25 @@ export class CarManager {
     this.group = new THREE.Group();
     this.group.name = 'cars';
     renderer.add(this.group);
+    this._raycaster = new THREE.Raycaster();
+  }
+
+  // Dispose all car geometries/materials/textures (session switch).
+  dispose() {
+    for (const car of this.cars.values()) {
+      car.group.traverse((o) => {
+        if (o.geometry && o.geometry.dispose) o.geometry.dispose();
+        if (o.material) {
+          const mats = Array.isArray(o.material) ? o.material : [o.material];
+          for (const m of mats) {
+            if (m && m.map && m.map.dispose) m.map.dispose();
+            if (m && m.dispose) m.dispose();
+          }
+        }
+      });
+    }
+    this.cars.clear();
+    this.renderer.remove(this.group);
   }
 
   static async tryLoadGLTF(url) {
@@ -44,8 +68,13 @@ export class CarManager {
     label.position.set(0, 6.5, 0);
     built.group.add(label);
     built.group.visible = false;
+    built.group.userData.driverNumber = num; // for raycast picking
     this.group.add(built.group);
-    car = { ...built, label, num, alpha: 1, lastHeading: 0, cur: new THREE.Vector3(), tgt: new THREE.Vector3(), inited: false };
+    car = {
+      ...built, label, num, alpha: 1, lastHeading: 0,
+      cur: new THREE.Vector3(), tgt: new THREE.Vector3(), inited: false,
+      labelText: '', wheelSpin: 0,
+    };
     this.cars.set(num, car);
     return car;
   }
@@ -53,44 +82,85 @@ export class CarManager {
   setSelected(num) {
     this.selected = num;
     for (const [n, car] of this.cars) {
-      const on = n === num;
-      if (car.ring) car.ring.visible = on;
-      if (car.label.material.map) car.label.scale.setScalar(on ? 1.25 : 1);
+      if (car.ring) car.ring.visible = n === num;
     }
   }
 
   // Update all cars for session time T given a Map(num -> {x,y,z,heading,alpha,present}).
-  update(samples, dt) {
+  // `tMs` is used for the ticking floating lap-time label.
+  update(samples, dt, tMs) {
+    const zoom = this.renderer.frustumSize || 260;
+    // Scale labels so they stay a roughly constant on-screen size as the camera
+    // zooms; hide the lap time when zoomed far out to avoid clutter.
+    const labelScale = clamp(zoom / 260, 0.7, 2.4);
+    const showLapTime = zoom < LAPTIME_HIDE_FRUSTUM;
+
     for (const [num, s] of samples) {
       const car = this.ensureCar(num);
       const scene = this.transform.toScene(s.x, s.y);
       car.tgt.set(scene.x, 0, scene.z);
       if (!car.inited) { car.cur.copy(car.tgt); car.inited = true; }
-      // Smooth follow (interp already smooth; this just damps snaps on seek).
+      const moved = car.cur.distanceTo(car.tgt);
       car.cur.lerp(car.tgt, 0.5);
       car.group.position.copy(car.cur);
 
       // Heading: OpenF1 world (x,y) → scene (x,z); scene heading = atan2(dz,dx).
-      // world heading is atan2(dy,dx); z maps from y so sign preserved.
       let h = -s.heading + Math.PI / 2; // align model's +Z forward
-      // Smooth the heading (shortest angular path).
       car.lastHeading = lerpAngle(car.lastHeading, h, 0.35);
       car.group.rotation.y = car.lastHeading;
 
       // Fade
       const targetAlpha = s.alpha == null ? 1 : s.alpha;
       car.alpha += (targetAlpha - car.alpha) * 0.2;
-      const visible = car.alpha > 0.02;
-      car.group.visible = visible;
+      car.group.visible = car.alpha > 0.02;
       setOpacity(car, car.alpha);
 
-      // wheels spin proportional to recent movement
-      const speed = car.cur.distanceTo(car.tgt);
+      // Wheels spin proportional to recent movement.
+      if (car.wheels && car.wheels.length) {
+        car.wheelSpin += moved * 0.5;
+        for (const w of car.wheels) w.rotation.x = car.wheelSpin;
+      }
+
+      // Floating label: acronym + live current-lap time.
+      const sel = num === this.selected;
+      const ls = (sel ? 1.25 : 1) * labelScale;
+      car.label.scale.set(6 * ls, 3.75 * ls, 1);
+      let timeStr = '';
+      if (showLapTime && tMs != null) {
+        const lap = inProgressLap(this.store.laps, num, tMs);
+        if (lap && lap.date_start) {
+          const ms = tMs - Date.parse(lap.date_start);
+          if (ms >= 0 && ms < 600000) timeStr = fmtLiveLap(ms);
+        }
+      }
+      const wanted = `${this.store.acronym(num)}|${timeStr}`;
+      if (wanted !== car.labelText) {
+        car.labelText = wanted;
+        car.label.userData.redraw(this.store.acronym(num), timeStr);
+      }
     }
     // Hide cars with no sample this frame.
     for (const [num, car] of this.cars) {
       if (!samples.has(num)) car.group.visible = false;
     }
+  }
+
+  // Raycast a normalized device coord (x,y in [-1,1]) against cars; returns the
+  // driver_number of the nearest hit (car body or its label) or null.
+  pick(ndc, camera) {
+    this._raycaster.setFromCamera(ndc, camera);
+    const hits = this._raycaster.intersectObjects(this.group.children, true);
+    for (const hit of hits) {
+      let o = hit.object;
+      while (o) {
+        if (o.userData && o.userData.driverNumber != null) {
+          const car = this.cars.get(o.userData.driverNumber);
+          if (car && car.group.visible) return o.userData.driverNumber;
+        }
+        o = o.parent;
+      }
+    }
+    return null;
   }
 
   selectedWorldPos() {
@@ -115,6 +185,8 @@ function lerpAngle(a, b, t) {
   while (d < -Math.PI) d += Math.PI * 2;
   return a + d * t;
 }
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 // --- procedural low-poly F1 -------------------------------------------------
 
@@ -247,29 +319,41 @@ function buildCarFromGLTF(teamColor) {
 
 function makeLabel(text, colorHex) {
   const canvas = document.createElement('canvas');
-  const S = 256;
-  canvas.width = S; canvas.height = 128;
+  const W = 256, H = 160;
+  canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, S, 128);
-  // pill background
-  const pad = 12;
-  roundRect(ctx, pad, 24, S - pad * 2, 80, 18);
-  ctx.fillStyle = 'rgba(10,14,20,0.82)';
-  ctx.fill();
-  ctx.lineWidth = 6;
-  ctx.strokeStyle = colorHex;
-  ctx.stroke();
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 58px "Arial Narrow", Arial, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, S / 2, 66);
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.anisotropy = 4;
   const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: true, depthWrite: false });
   const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(6, 3, 1);
+  sprite.scale.set(6, 3.75, 1);
+
+  // Redraw acronym (+ optional live lap time on a second line).
+  const redraw = (acr, timeStr) => {
+    ctx.clearRect(0, 0, W, H);
+    const pad = 12;
+    const boxH = timeStr ? 116 : 78;
+    roundRect(ctx, pad, 18, W - pad * 2, boxH, 18);
+    ctx.fillStyle = 'rgba(10,14,20,0.82)';
+    ctx.fill();
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = colorHex;
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 54px "Arial Narrow", Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(acr, W / 2, timeStr ? 52 : 57);
+    if (timeStr) {
+      ctx.fillStyle = '#8fe3ff';
+      ctx.font = '600 40px "Arial Narrow", Arial, sans-serif';
+      ctx.fillText(timeStr, W / 2, 100);
+    }
+    tex.needsUpdate = true;
+  };
+  redraw(text, '');
+  sprite.userData.redraw = redraw;
   return sprite;
 }
 

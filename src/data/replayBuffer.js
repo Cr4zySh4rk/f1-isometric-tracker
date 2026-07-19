@@ -67,7 +67,11 @@ export class ReplayBuffer {
     const cur = this.windowIndex(tMs);
     const last = this.totalWindows() - 1;
     for (let i = cur; i <= Math.min(last, cur + PREFETCH_AHEAD); i++) {
-      if (i >= 0 && !this.windows.has(i)) this._fetchWindow(i);
+      if (i < 0) continue;
+      const st = this.windows.get(i);
+      // Fetch never-seen windows; retry previously errored ones (but not
+      // in-flight, loaded or live-blocked ones).
+      if (st === undefined || st === 'error') this._fetchWindow(i);
     }
     this._evict(cur);
   }

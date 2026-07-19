@@ -3,6 +3,11 @@
 // to localStorage (they're small and let the track/leaderboard render instantly).
 
 import { OpenF1 } from '../api/openf1.js';
+import { normalizeRaceControl, trackStatusAt, penaltiesAt } from './raceControl.js';
+import {
+  fastestLapAt, bestLapByDriverAt, currentLapAt, lastCompletedLap,
+  startingPositions, isInPitAt,
+} from './timing.js';
 
 const LS_PREFIX = 'f1iso.session.';
 
@@ -31,6 +36,8 @@ export class SessionStore {
     this.laps = [];
     this.positions = [];
     this.raceControl = [];
+    this.rcEvents = []; // normalized + sorted race_control (with tMs)
+    this.pit = [];
     this.result = [];
     this._loaded = false;
   }
@@ -50,17 +57,21 @@ export class SessionStore {
     const cachedDrivers = lsGet(`drivers.${k}`);
     const cachedLaps = lsGet(`laps.${k}`);
 
-    const [drivers, laps, positions, raceControl] = await Promise.all([
+    const [drivers, laps, positions, raceControl, pit] = await Promise.all([
       cachedDrivers ? Promise.resolve(cachedDrivers) : safe(() => OpenF1.drivers(k), []),
       cachedLaps ? Promise.resolve(cachedLaps) : safe(() => OpenF1.laps(k), []),
       safe(() => OpenF1.position(k), []),
       safe(() => OpenF1.raceControl(k), []),
+      safe(() => OpenF1.pit(k), []),
     ]);
 
     this.drivers = normalizeDrivers(drivers);
     this.laps = Array.isArray(laps) ? laps : [];
     this.positions = Array.isArray(positions) ? positions : [];
     this.raceControl = Array.isArray(raceControl) ? raceControl : [];
+    this.rcEvents = normalizeRaceControl(this.raceControl);
+    this.pit = Array.isArray(pit) ? pit : [];
+    this._startPositions = startingPositions(this.positions);
 
     for (const d of this.drivers) this.driversByNumber.set(d.driver_number, d);
 
@@ -94,93 +105,50 @@ export class SessionStore {
     };
   }
 
-  // Fastest complete (non-pit-out, plausible) lap across all drivers.
+  // Fastest complete (non-pit-out, plausible) lap across all drivers, as of the
+  // end of the session (used by the track builder to pick a clean flying lap).
   fastestLap() {
-    let best = null;
-    for (const lap of this.laps) {
-      const d = lap.lap_duration;
-      if (typeof d !== 'number' || !isFinite(d) || d <= 0) continue;
-      if (lap.is_pit_out_lap) continue;
-      if (!lap.date_start) continue;
-      if (d < 40 || d > 300) continue; // sanity: F1 lap times
-      if (!best || d < best.lap_duration) best = lap;
-    }
-    // Fallback: any lap with a duration + date_start
-    if (!best) {
-      for (const lap of this.laps) {
-        if (typeof lap.lap_duration === 'number' && lap.lap_duration > 0 && lap.date_start) {
-          if (!best || lap.lap_duration < best.lap_duration) best = lap;
-        }
-      }
-    }
-    return best;
+    return fastestLapAt(this.laps, Infinity);
   }
 
-  // Best lap time per driver (for practice/quali leaderboard fallback).
-  bestLapByDriver() {
-    const map = new Map();
-    for (const lap of this.laps) {
-      const d = lap.lap_duration;
-      if (typeof d !== 'number' || d <= 0) continue;
-      const cur = map.get(lap.driver_number);
-      if (!cur || d < cur.lap_duration) map.set(lap.driver_number, lap);
-    }
-    return map;
+  // Best lap time per driver up to T (for practice/quali leaderboard fallback).
+  bestLapByDriver(tMs = Infinity) {
+    return bestLapByDriverAt(this.laps, tMs);
   }
 
-  // Latest lap number seen up to session time T (ms epoch).
+  // Latest lap number / total up to session time T (ms epoch).
   currentLapAt(tMs) {
-    let maxLap = 0;
-    let total = 0;
-    for (const lap of this.laps) {
-      if (lap.lap_number > total) total = lap.lap_number;
-      const ds = lap.date_start ? Date.parse(lap.date_start) : NaN;
-      if (!isNaN(ds) && ds <= tMs && lap.lap_number > maxLap) maxLap = lap.lap_number;
-    }
-    return { current: maxLap || 1, total: total || 0 };
+    return currentLapAt(this.laps, tMs);
   }
 
   // Last completed lap for a driver at time T.
   lastLapFor(num, tMs) {
-    let best = null;
-    for (const lap of this.laps) {
-      if (lap.driver_number !== num) continue;
-      if (typeof lap.lap_duration !== 'number' || lap.lap_duration <= 0) continue;
-      const ds = lap.date_start ? Date.parse(lap.date_start) : NaN;
-      const done = isNaN(ds) ? true : ds + lap.lap_duration * 1000 <= tMs;
-      if (!done) continue;
-      if (!best || lap.lap_number > best.lap_number) best = lap;
-    }
-    return best;
+    return lastCompletedLap(this.laps, num, tMs);
   }
 
-  // Race-control state (flag / SC / VSC) active at time T.
-  flagStateAt(tMs) {
-    let state = { flag: null, message: null, category: null, safetyCar: null };
-    const events = this.raceControl
-      .filter((e) => e.date && Date.parse(e.date) <= tMs)
-      .sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
-    for (const e of events) {
-      const flag = (e.flag || '').toUpperCase();
-      const msg = (e.message || '').toUpperCase();
-      const cat = (e.category || '').toUpperCase();
-      if (cat === 'FLAG') {
-        if (flag === 'CHEQUERED') state = { ...state, flag: 'CHEQUERED', message: e.message };
-        else if (flag === 'CLEAR' || flag === 'GREEN') state.flag = null;
-        else if (['YELLOW', 'DOUBLE YELLOW', 'RED'].includes(flag)) state.flag = flag;
-      }
-      if (cat === 'SAFETYCAR' || msg.includes('SAFETY CAR') || msg.includes('VIRTUAL SAFETY')) {
-        if (msg.includes('VIRTUAL SAFETY CAR') && msg.includes('DEPLOY')) state.safetyCar = 'VSC';
-        else if (msg.includes('SAFETY CAR') && (msg.includes('DEPLOY') || msg.includes('IN THIS LAP') === false && msg.includes('DEPLOYED'))) state.safetyCar = 'SC';
-        if (msg.includes('ENDING') || msg.includes('IN THIS LAP') || msg.includes('CLEAR')) {
-          // fades out below when a clear/green flag arrives
-        }
-        if ((msg.includes('SAFETY CAR') || msg.includes('VIRTUAL SAFETY CAR')) && (msg.includes('ENDING') || msg.includes('RETURN') || msg.includes('IN THIS LAP'))) {
-          state.safetyCar = null;
-        }
-      }
-    }
-    return state;
+  // Session-fastest completed lap up to T (purple FL marker).
+  fastestLapAt(tMs) {
+    return fastestLapAt(this.laps, tMs);
+  }
+
+  // Track status (green/yellow/SC/red/…) active at time T.
+  trackStatusAt(tMs) {
+    return trackStatusAt(this.rcEvents, tMs);
+  }
+
+  // Active penalties by driver up to T.
+  penaltiesAt(tMs) {
+    return penaltiesAt(this.rcEvents, tMs);
+  }
+
+  // Grid/starting position for a driver.
+  startingPosition(num) {
+    return this._startPositions ? this._startPositions.get(num) : undefined;
+  }
+
+  // Is the driver in the pits at time T?
+  isInPitAt(num, tMs) {
+    return isInPitAt(this.pit, num, tMs);
   }
 }
 

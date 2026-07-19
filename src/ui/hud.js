@@ -1,8 +1,24 @@
-// HUD: leaderboard, lap counter, session title, flag/SC/VSC banner.
+// Timing tower (F1 TV style): header (session label + clock), track-status
+// strip, and per-driver rows with position-change arrows, team-color bars,
+// delta column, pit / penalty / fastest-lap badges. Everything is replay-time
+// aware — state is computed as of session time T.
 //
-// Standings at session time T:
-//  - Races: /position (changes-only) gives running order; /intervals gives gaps.
-//  - Practice/Quali: fall back to best-lap order.
+// All timing decisions live in ../data/timing.js and ../data/raceControl.js
+// (pure, unit-tested); this module only renders the model to the DOM.
+
+import { buildTowerRows } from '../data/timing.js';
+import { fmtSessionClock } from '../util/format.js';
+
+export function sessionLabel(session) {
+  const name = (session.session_name || session.session_type || '').toLowerCase();
+  if (/sprint\s*(shootout|qual)/.test(name)) return 'SQ';
+  if (name.includes('sprint')) return 'SPRINT';
+  if (name.includes('race')) return 'RACE';
+  if (name.includes('qualifying') || name === 'q') return 'Q';
+  const m = name.match(/practice\s*(\d)/) || name.match(/fp\s*(\d)/);
+  if (m) return `P${m[1]}`;
+  return (session.session_name || 'SESSION').toUpperCase().slice(0, 8);
+}
 
 export class Hud {
   constructor({ store, buffer, clock, onSelectDriver }) {
@@ -11,79 +27,63 @@ export class Hud {
     this.clock = clock;
     this.onSelectDriver = onSelectDriver;
 
-    this.elLeaderboard = document.getElementById('leaderboard');
+    this.elTower = document.getElementById('leaderboard');
     this.elLap = document.getElementById('lap-counter');
-    this.elFlag = document.getElementById('flag-banner');
-    this.elTitle = document.getElementById('session-name');
+    this.elFlag = document.getElementById('flag-banner'); // legacy top banner (kept hidden)
 
     this.selected = null;
-    this._lastFlag = undefined;
-    this._rowCache = new Map();
+    this.intervalMode = 'interval'; // race delta column: 'interval' | 'gap'
+    this._lastStatus = undefined;
     this._lastRenderMs = 0;
-    this._orderCache = null;
-    this._orderCacheAt = -1;
 
-    this._buildTitle();
-    this.elLeaderboard.classList.remove('hidden');
+    this._buildShell();
+    this.elTower.classList.remove('hidden');
     this.elLap.classList.remove('hidden');
   }
 
-  _buildTitle() {
-    const s = this.store.session;
-    const parts = [s.circuit_short_name || s.country_name || '', s.session_name || ''].filter(Boolean);
-    this.elTitle.textContent = parts.join(' · ') || 'Session';
-  }
+  _buildShell() {
+    this.elTower.classList.add('tower');
+    this.elTower.innerHTML = `
+      <div class="tw-header">
+        <span class="tw-mark">F1</span>
+        <span class="tw-session" id="tw-session">${sessionLabel(this.store.session)}</span>
+        <span class="tw-clock" id="tw-clock">--:--</span>
+      </div>
+      <div class="tw-status tw-status-green" id="tw-status">TRACK CLEAR</div>
+      <div class="tw-rows" id="tw-rows"></div>`;
+    this.elRows = this.elTower.querySelector('#tw-rows');
+    this.elClock = this.elTower.querySelector('#tw-clock');
+    this.elStatus = this.elTower.querySelector('#tw-status');
 
-  setSelected(num) {
-    this.selected = num;
-  }
-
-  // Compute running order at time T.
-  orderAt(tMs) {
-    if (this._orderCacheAt === tMs && this._orderCache) return this._orderCache;
-
-    let order;
-    if (this.store.isRace() && this.store.positions.length) {
-      const pos = new Map();
-      for (const p of this.store.positions) {
-        if (!p.date) continue;
-        if (Date.parse(p.date) > tMs) continue;
-        pos.set(p.driver_number, p.position);
+    // Event delegation: row click selects driver; status/delta header toggles.
+    this.elRows.addEventListener('click', (e) => {
+      const row = e.target.closest('.tw-row');
+      if (row && row.dataset.num != null) {
+        this.onSelectDriver && this.onSelectDriver(parseInt(row.dataset.num, 10));
       }
-      const nums = this.store.drivers.map((d) => d.driver_number);
-      order = nums
-        .map((n) => ({ num: n, position: pos.get(n) }))
-        .filter((o) => o.position != null)
-        .sort((a, b) => a.position - b.position);
-      // Append any drivers without a position at the end.
-      const have = new Set(order.map((o) => o.num));
-      for (const n of nums) if (!have.has(n)) order.push({ num: n, position: 99 });
-    } else {
-      // Best-lap order.
-      const best = this.store.bestLapByDriver();
-      order = [...best.entries()]
-        .map(([num, lap]) => ({ num, position: null, best: lap.lap_duration }))
-        .sort((a, b) => a.best - b.best)
-        .map((o, i) => ({ ...o, position: i + 1 }));
-      // Drivers without a lap yet.
-      const have = new Set(order.map((o) => o.num));
-      for (const d of this.store.drivers) {
-        if (!have.has(d.driver_number)) order.push({ num: d.driver_number, position: order.length + 1 });
+    });
+    this.elTower.querySelector('.tw-header').addEventListener('click', () => {
+      // Toggle race delta column between interval and gap-to-leader.
+      if (this.store.isRace()) {
+        this.intervalMode = this.intervalMode === 'interval' ? 'gap' : 'interval';
       }
-    }
-    this._orderCache = order;
-    this._orderCacheAt = tMs;
-    return order;
+    });
   }
+
+  setSelected(num) { this.selected = num; }
 
   render(tMs) {
-    // Throttle DOM updates to ~8 Hz.
     if (tMs - this._lastRenderMs < 120 && this._lastRenderMs) return;
     this._lastRenderMs = tMs;
-
+    this._renderClock(tMs);
     this._renderLap(tMs);
-    this._renderFlag(tMs);
-    this._renderBoard(tMs);
+    this._renderStatus(tMs);
+    this._renderRows(tMs);
+  }
+
+  _renderClock(tMs) {
+    const remaining = Math.max(0, this.clock.end - tMs);
+    this.elClock.textContent = fmtSessionClock(remaining);
   }
 
   _renderLap(tMs) {
@@ -96,76 +96,67 @@ export class Hud {
     }
   }
 
-  _renderFlag(tMs) {
-    const st = this.store.flagStateAt(tMs);
-    let kind = null, text = null;
-    if (st.safetyCar === 'SC') { kind = 'SC'; text = 'SAFETY CAR'; }
-    else if (st.safetyCar === 'VSC') { kind = 'VSC'; text = 'VIRTUAL SAFETY CAR'; }
-    else if (st.flag === 'RED') { kind = 'RED'; text = 'RED FLAG'; }
-    else if (st.flag === 'YELLOW' || st.flag === 'DOUBLE YELLOW') { kind = st.flag === 'DOUBLE YELLOW' ? 'DOUBLE YELLOW' : 'YELLOW'; text = st.flag === 'DOUBLE YELLOW' ? 'DOUBLE YELLOW' : 'YELLOW FLAG'; }
-    else if (st.flag === 'CHEQUERED') { kind = 'CHEQUERED'; text = 'CHEQUERED FLAG'; }
-
-    if (kind === this._lastFlag) return;
-    this._lastFlag = kind;
-    if (this.onFlagChange) this.onFlagChange(kind);
-
-    if (!kind) {
-      this.elFlag.classList.add('hidden');
-      this.elFlag.className = 'flag-banner hidden';
-      return;
+  _renderStatus(tMs) {
+    const st = this.store.trackStatusAt(tMs);
+    if (st.status !== this._lastStatus) {
+      this._lastStatus = st.status;
+      this.elStatus.textContent = st.label;
+      this.elStatus.className = `tw-status tw-status-${st.status.toLowerCase().replace(/_/g, '-')}`
+        + (st.pulse ? ' tw-pulse' : '');
+      if (this.onStatusChange) this.onStatusChange(st);
     }
-    this.elFlag.textContent = text;
-    this.elFlag.className = `flag-banner flag-${kind.replace(/\s+/g, '-').toLowerCase()}`;
   }
 
-  _renderBoard(tMs) {
-    const order = this.orderAt(tMs);
+  _renderRows(tMs) {
+    const driverNums = this.store.drivers.map((d) => d.driver_number);
     const isRace = this.store.isRace();
-    const frag = document.createDocumentFragment();
-    let rank = 0;
-    for (const o of order) {
-      rank++;
-      const num = o.num;
-      const acronym = this.store.acronym(num);
-      const color = this.store.teamColour(num);
-      let gap = '';
-      if (isRace) {
+    const fastest = this.store.fastestLapAt(tMs);
+    const rows = buildTowerRows({
+      isRace, driverNums, laps: this.store.laps, positions: this.store.positions, tMs,
+      intervalFn: (num) => {
         const iv = this.buffer && this.buffer.intervalAt(num, tMs);
-        if (rank === 1) gap = 'LEADER';
-        else if (iv) gap = fmtGap(iv.interval != null ? iv.interval : iv.gap);
-        else gap = '—';
-      } else {
-        gap = o.best ? fmtLap(o.best) : '—';
-      }
-      const last = this.store.lastLapFor(num, tMs);
-      const lastStr = last ? fmtLap(last.lap_duration) : '';
+        return iv ? { gap_to_leader: iv.gap, interval: iv.interval } : null;
+      },
+      intervalMode: this.intervalMode,
+      startPositions: this.store._startPositions || new Map(),
+      penalties: this.store.penaltiesAt(tMs),
+      pitFn: (num) => this.store.isInPitAt(num, tMs),
+      fastestNum: fastest ? fastest.driver_number : null,
+    });
 
-      const row = document.createElement('div');
-      row.className = 'lb-row' + (num === this.selected ? ' lb-selected' : '');
-      row.dataset.num = num;
-      row.innerHTML =
-        `<span class="lb-pos">${rank}</span>` +
-        `<span class="lb-chip" style="background:${color}"></span>` +
-        `<span class="lb-acr">${acronym}</span>` +
-        `<span class="lb-gap">${gap}</span>` +
-        (isRace ? `<span class="lb-last">${lastStr}</span>` : '');
-      row.addEventListener('click', () => this.onSelectDriver && this.onSelectDriver(num));
-      frag.appendChild(row);
+    const frag = document.createDocumentFragment();
+    for (const r of rows) {
+      const acronym = this.store.acronym(r.num);
+      const color = this.store.teamColour(r.num);
+      const el = document.createElement('div');
+      el.className = 'tw-row'
+        + (r.num === this.selected ? ' tw-selected' : '')
+        + (r.isFastest ? ' tw-fl' : '')
+        + (r.inPit ? ' tw-inpit' : '');
+      el.dataset.num = r.num;
+
+      const badges = [];
+      if (r.isFastest) badges.push('<span class="tw-badge tw-badge-fl" title="Fastest lap">FL</span>');
+      if (r.inPit) badges.push('<span class="tw-badge tw-badge-pit" title="In pit">P</span>');
+      if (r.penalty) {
+        badges.push(`<span class="tw-badge tw-badge-pen" title="${escapeHtml(r.penalty.message)}">${escapeHtml(r.penalty.type)}</span>`);
+      }
+
+      el.innerHTML =
+        `<span class="tw-pos">${r.position}</span>` +
+        `<span class="tw-arrow tw-arrow-${r.arrow}">${r.arrowGlyph}</span>` +
+        `<span class="tw-bar" style="background:${color}"></span>` +
+        `<span class="tw-acr">${escapeHtml(acronym)}</span>` +
+        `<span class="tw-badges">${badges.join('')}</span>` +
+        `<span class="tw-delta tw-delta-${r.deltaKind}">${escapeHtml(r.delta)}</span>`;
+      frag.appendChild(el);
     }
-    this.elLeaderboard.replaceChildren(frag);
+    this.elRows.replaceChildren(frag);
   }
 }
 
-function fmtLap(sec) {
-  if (typeof sec !== 'number' || !isFinite(sec)) return '';
-  const m = Math.floor(sec / 60);
-  const s = (sec - m * 60);
-  return `${m}:${s.toFixed(3).padStart(6, '0')}`;
-}
-
-function fmtGap(v) {
-  if (v == null) return '—';
-  if (typeof v === 'string') return v; // e.g. "+1 LAP"
-  if (typeof v === 'number') return v === 0 ? '—' : `+${v.toFixed(3)}`;
-  return String(v);
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
 }

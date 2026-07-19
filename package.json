@@ -1,0 +1,18 @@
+{
+  "name": "f1-isometric-tracker",
+  "version": "1.0.0",
+  "description": "Isometric 3D Formula 1 session tracker/visualizer powered by the OpenF1 API",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.8"
+  }
+}

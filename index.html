@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#0a0e14" />
+    <title>F1 Isometric Tracker</title>
+    <meta name="description" content="Isometric 3D Formula 1 session visualizer built from real telemetry via the OpenF1 API." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8F%8E%EF%B8%8F%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+
+      <!-- Top bar: session title + flag banner -->
+      <header id="topbar">
+        <div id="session-title" class="session-title">
+          <span class="brand">F1</span>
+          <span id="session-name">Isometric Tracker</span>
+        </div>
+        <div id="flag-banner" class="flag-banner hidden"></div>
+        <div id="lap-counter" class="lap-counter hidden"></div>
+      </header>
+
+      <!-- Leaderboard HUD -->
+      <aside id="leaderboard" class="leaderboard hidden"></aside>
+
+      <!-- Global banner (live-block / errors) -->
+      <div id="banner" class="banner hidden"></div>
+
+      <!-- Bottom transport bar -->
+      <footer id="transport" class="transport hidden"></footer>
+
+      <!-- Session picker / settings modal -->
+      <div id="picker" class="picker-overlay"></div>
+
+      <!-- Corner buttons -->
+      <button id="follow-btn" class="corner-btn follow-btn" title="Follow selected car (F)" aria-label="Follow car">◎ Follow</button>
+      <button id="settings-btn" class="corner-btn settings-btn" title="Settings" aria-label="Settings">⚙</button>
+
+      <!-- Loading overlay -->
+      <div id="loading" class="loading-overlay">
+        <div class="loader-ring"></div>
+        <div id="loading-text" class="loading-text">Loading…</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

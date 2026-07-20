@@ -23,10 +23,15 @@ export class LiveBlockError extends Error {
 }
 
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, opts = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    // `isNetwork` distinguishes a genuine fetch rejection / timeout (no
+    // connectivity, CORS failure, DNS…) from an HTTP-level API error where the
+    // server *did* respond. Only the former should surface "Could not reach
+    // OpenF1. Check your connection." to the user.
+    this.isNetwork = !!opts.isNetwork;
   }
 }
 
@@ -83,7 +88,9 @@ async function doFetch(url) {
   try {
     res = await fetch(url, { headers, mode: 'cors' });
   } catch (netErr) {
-    throw new ApiError(`Network error: ${netErr.message}`, 0);
+    // Genuine fetch rejection (offline, DNS, CORS, aborted) — the only case that
+    // should read as a connectivity problem.
+    throw new ApiError(`Network error: ${netErr.message}`, 0, { isNetwork: true });
   }
 
   const text = res.status === 429 ? '' : await res.text();

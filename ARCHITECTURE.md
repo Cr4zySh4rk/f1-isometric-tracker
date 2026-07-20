@@ -139,3 +139,108 @@ src/api/queue.js        RateLimitedQueue (injectable clock) + classifyResponse
 - Sparse location samples (red flags, pits, in-lap gaps) → interpolation clamps,
   cars fade when data gap > 10 s.
 - WebGL unavailable → friendly message.
+
+## 7. Data providers & Approximate mode (multi-provider failover)
+
+The app talks to data through a **provider interface**, so it can survive OpenF1
+being live-blocked or down by seamlessly falling back to a second source.
+
+```
+src/data/providers/
+  openf1Provider.js   primary  — full telemetry (x/y/z location, intervals, race control…)
+  jolpicaProvider.js  fallback — schedule/results/lap-times/order, NO telemetry
+  jolpicaMap.js       pure Ergast→OpenF1-shape mappers (unit-tested vs real fixtures)
+  manager.js          ProviderManager: failover state machine + recovery poll
+src/data/approxPosition.js  lap-time → position-on-centerline estimator (pure)
+src/data/approxBuffer.js    ReplayBuffer-shaped sampler for Approximate mode
+```
+
+Provider interface (all async, return OpenF1-shaped records):
+`getMeetings(year)`, `getSessions(params)`, `getDrivers/getLaps/getPositions/
+getRaceControl/getPit/getSessionResult(session)`,
+`getLocationWindow(session, aISO, bISO)` → rows **or `null`** (no telemetry),
+`getIntervals(...)`, `probe()`, plus `capabilities.telemetry`.
+
+### Failover state machine (`ProviderManager`)
+- Every data call routes through `manager.run(fn)`. In **live** mode it uses the
+  OpenF1 provider; if a call fails with a **live-block** or a **genuine network
+  error** (`isNetwork` — offline/DNS/CORS/timeout), it **demotes to Approximate
+  mode** and retries the same call on Jolpica. A plain HTTP/API error (400/404…)
+  is *not* a failover trigger and surfaces to the caller.
+- **Recovery:** while degraded it polls `OpenF1.probe()` every 60 s
+  (`checkRecovery`); on success it **promotes back to live** and fires
+  `onModeChange`, so `main.js` reloads the session with real telemetry
+  (auto-reload for OpenF1-native sessions; a "reopen picker" prompt for a
+  Jolpica session whose key can't be mapped to OpenF1).
+- The whole machine is deterministic — providers, `probe`, and the poll
+  scheduler are injectable — and unit-tested in `test/providerFailover.test.js`.
+
+### Approximate mode (no telemetry)
+When the active provider has no x/y (`getLocationWindow → null`):
+- **UI is clearly labeled** with a persistent info banner: *"Approximate mode —
+  live telemetry unavailable…"*. Session picker / results / lap-by-lap order come
+  from Jolpica.
+- The track is a **synthetic oval** (`syntheticOval`, since Ergast has no GPS),
+  and cars animate via `approxPosition`: `progress = elapsed-in-lap /
+  lap_duration` mapped to arc length along the closed centerline (one lap = one
+  loop). Missing/absent `lap_duration` (pit in/out) is backfilled with the
+  driver's median lap; before their first lap a car sits faded on the grid.
+- `ApproxBuffer` mirrors `ReplayBuffer`'s `sampleAll(t)` contract, so the render
+  loop, HUD and transport are agnostic to which mode is active.
+
+### Why no *direct* F1 provider (openf1-project findings + exact CORS/auth results)
+The [openf1](https://github.com/br-g/openf1) project ingests **server-side**
+Python from F1's live-timing endpoints and decodes them into the same records
+OpenF1 serves us:
+- Source of truth: `https://livetiming.formula1.com/static/<session>/…` topics,
+  notably **`Position.z`** (car x/y/z) and `CarData.z` — **deflate-compressed,
+  base64 line-delimited** feeds. `LocationCollection` (source topic `Position.z`)
+  yields `{driver_number, date, x, y, z}` per `Entries` timestamp — i.e. OpenF1's
+  `/location` is exactly this feed decoded. Live ingestion uses SignalR
+  (`/signalr/negotiate` → `/connect`).
+
+Re-tested from a static GitHub-Pages origin (`curl -H "Origin:
+https://cr4zysh4rk.github.io" …`, July 2026):
+
+| URL | Result | Browser-usable? |
+|---|---|---|
+| `…/static/StreamingStatus.json` | **HTTP 200, but NO `access-control-allow-origin` header** | ❌ blocked by CORS |
+| `…/signalr/negotiate?…` | **HTTP 401** | ❌ auth required |
+
+So a client-side app **cannot** read F1 live-timing directly (no CORS on
+`/static`, negotiate is 401). **What we ported: nothing executable in-browser** —
+the *understanding* that OpenF1's `/location` == decoded `Position.z` guides our
+design, and the Jolpica fallback + `approxPosition` estimator substitute for the
+unreachable telemetry using lap times. A direct F1 provider is intentionally
+omitted for the reasons above.
+
+### Jolpica (fallback) specifics
+- Base `https://api.jolpi.ca/ergast/f1/…`; classic Ergast `{MRData:…}` envelope.
+- **CORS verified:** `access-control-allow-origin: *` from the Pages origin ✅.
+- **Rate limits** (unauthenticated): ~4 req/s burst, 500 req/hour — the client
+  throttles to 4/s via the shared `RateLimitedQueue` and pages `laps` (~1000
+  timing rows/race) at `limit=100`.
+- Mappers (`jolpicaMap.js`) turn schedule→sessions/meetings, results→drivers/
+  classification/grid, and per-lap timings→OpenF1-shaped `laps`
+  (`date_start` + `lap_duration`, cumulative from the green flag) + running order.
+
+## 8. Real-data validation (performed against the live API, session 11334)
+
+Validated the parsers/track math against **real** OpenF1 v1 responses (2026-07-19
+Spa Race) and real Jolpica 2025 data via node scripts; fixtures in
+`test/fixtures/openf1_real.json` and `jolpica_real.json` are faithful subsets.
+
+- **Shapes confirmed / guarded** (`test/realShapes.test.js`): dates are
+  microsecond precision with a **`+00:00` offset** (not `Z`) — `Date.parse`
+  handles both; `team_colour` is a **bare 6-hex** string (no `#`);
+  laps use **`duration_sector_1/2/3`** + `lap_duration`; `intervals.interval`
+  is **nullable**; `session_result` carries `dnf/dns/dsq/duration/gap_to_leader`.
+  Our existing parsers already matched these — no shape fixes were required.
+- **Track math verdict — PASS.** Ran the real fastest-lap `/location` trace
+  (driver 1, lap 44, 445 samples) through `trackMath`: closed loop, **length
+  ≈ 7148 m vs Spa's real 7004 m (~2%)**, **no NaNs**, 16 curvature peaks
+  (corners), endpoint gap ≈ one segment. OpenF1 `location` x/y are in ~1/10 m
+  units (only relative geometry matters after `fitTransform`).
+- **Jolpica path — PASS.** Mapped the real 2025 season (30 sessions), round 1
+  (Norris/McLaren win, 921 lap rows → synthesized `date_start`+`lap_duration`),
+  and confirmed `approxPosition` animates monotonically along the oval.

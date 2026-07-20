@@ -322,6 +322,8 @@ html, body {
 }
 .banner-warn { background: rgba(60, 48, 10, 0.92); border-color: rgba(255, 210, 58, 0.4); color: #ffe08a; }
 .banner-error { background: rgba(60, 12, 10, 0.92); border-color: rgba(255, 60, 40, 0.4); color: #ffb3ab; }
+.banner-info { background: rgba(10, 34, 60, 0.92); border-color: rgba(90, 170, 255, 0.45); color: #aad4ff; }
+.banner-ok { background: rgba(10, 48, 26, 0.92); border-color: rgba(70, 220, 130, 0.4); color: #9df0bd; }
 .banner-btn {
   flex: none;
   background: var(--red);

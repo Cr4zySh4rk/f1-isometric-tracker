@@ -2,7 +2,7 @@
 // Small tables are fetched once and kept whole; drivers + laps are also mirrored
 // to localStorage (they're small and let the track/leaderboard render instantly).
 
-import { OpenF1 } from '../api/openf1.js';
+import { OpenF1Provider } from './providers/openf1Provider.js';
 import { normalizeRaceControl, trackStatusAt, penaltiesAt } from './raceControl.js';
 import {
   fastestLapAt, bestLapByDriverAt, currentLapAt, lastCompletedLap,
@@ -28,9 +28,13 @@ function lsSet(key, value) {
 }
 
 export class SessionStore {
-  constructor(session) {
+  constructor(session, source) {
     this.session = session; // the /sessions row
     this.sessionKey = session.session_key;
+    // `source` is the data-source facade (ProviderManager) or any object with
+    // getDrivers/getLaps/getPositions/getRaceControl/getPit(session). Defaults
+    // to a plain OpenF1 provider so the store works standalone.
+    this.source = source || new OpenF1Provider();
     this.drivers = [];
     this.driversByNumber = new Map();
     this.laps = [];
@@ -57,12 +61,14 @@ export class SessionStore {
     const cachedDrivers = lsGet(`drivers.${k}`);
     const cachedLaps = lsGet(`laps.${k}`);
 
+    const src = this.source;
+    const s = this.session;
     const [drivers, laps, positions, raceControl, pit] = await Promise.all([
-      cachedDrivers ? Promise.resolve(cachedDrivers) : safe(() => OpenF1.drivers(k), []),
-      cachedLaps ? Promise.resolve(cachedLaps) : safe(() => OpenF1.laps(k), []),
-      safe(() => OpenF1.position(k), []),
-      safe(() => OpenF1.raceControl(k), []),
-      safe(() => OpenF1.pit(k), []),
+      cachedDrivers ? Promise.resolve(cachedDrivers) : safe(() => src.getDrivers(s), []),
+      cachedLaps ? Promise.resolve(cachedLaps) : safe(() => src.getLaps(s), []),
+      safe(() => src.getPositions(s), []),
+      safe(() => src.getRaceControl(s), []),
+      safe(() => src.getPit(s), []),
     ]);
 
     this.drivers = normalizeDrivers(drivers);

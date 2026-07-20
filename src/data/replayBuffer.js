@@ -8,7 +8,8 @@
 // Location rows feed per-driver DriverTrack instances (engine/interp.js), which
 // own the interpolation. Intervals are stored as time-sorted arrays per driver.
 
-import { OpenF1, LiveBlockError } from '../api/openf1.js';
+import { LiveBlockError } from '../api/openf1.js';
+import { OpenF1Provider } from './providers/openf1Provider.js';
 import { DriverTrack } from '../engine/interp.js';
 
 const WINDOW_MS = 90000; // 90 s windows
@@ -16,8 +17,11 @@ const PREFETCH_AHEAD = 3; // keep 3 windows ahead of the cursor
 const KEEP_BEHIND = 1; // keep 1 window behind before eviction
 
 export class ReplayBuffer {
-  constructor(store) {
+  constructor(store, source) {
     this.store = store;
+    // Data-source facade (ProviderManager) or provider with
+    // getLocationWindow/getIntervals(session, aISO, bISO). Defaults to OpenF1.
+    this.source = source || new OpenF1Provider();
     this.sessionKey = store.sessionKey;
     this.isRace = store.isRace();
     const { start, end } = store.timeWindow();
@@ -101,8 +105,9 @@ export class ReplayBuffer {
     const sISO = new Date(start).toISOString();
     const eISO = new Date(end).toISOString();
     try {
-      const jobs = [OpenF1.location(this.sessionKey, sISO, eISO)];
-      if (this.isRace) jobs.push(OpenF1.intervals(this.sessionKey, sISO, eISO));
+      const sess = this.store.session;
+      const jobs = [this.source.getLocationWindow(sess, sISO, eISO)];
+      if (this.isRace) jobs.push(this.source.getIntervals(sess, sISO, eISO));
       const [loc, ivals] = await Promise.all(jobs);
       this._ingestLocation(loc);
       if (ivals) this._ingestIntervals(ivals);

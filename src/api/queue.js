@@ -91,23 +91,47 @@ export class RateLimitedQueue {
 }
 
 // Classify an OpenF1 HTTP response body into a control decision. Pure — used by
-// the fetch layer and unit-tested for live-block / 429 handling.
+// the fetch layer and unit-tested for live-block / 429 / API-error handling.
+//
+// The subtle case this guards against (the user-reported "Could not reach
+// OpenF1" bug): when the free tier is live-blocked, OpenF1 replies **HTTP 200,
+// CORS enabled, body = a JSON OBJECT** `{"detail": "Live F1 session in
+// progress…"}` — not an array and not a 4xx. We must therefore classify by the
+// SHAPE of the body (object-with-`detail`), independent of the HTTP status, so
+// the object never reaches array-expecting parse code (which would throw and be
+// mislabeled as a network failure).
+//
+//   • any status, body = {detail: /live f1 session/i}  → liveblock
+//   • any status, body = {detail: <other>}             → api error (distinct)
+//   • status 429                                        → retry429 (back-off)
+//   • status >= 400 (no usable detail)                  → api error
+//   • otherwise                                         → ok (data body)
 export function classifyResponse(status, body, retryAfterHeader) {
+  const isObj = body && typeof body === 'object' && !Array.isArray(body);
+  const detail = isObj ? body.detail : null;
+
+  // Live-block is recognised by body shape at ANY status (incl. 200).
+  if (detail != null && /live f1 session/i.test(String(detail))) {
+    return { kind: 'liveblock', detail: String(detail) };
+  }
+
   if (status === 429) {
     const retryAfter = parseFloat(retryAfterHeader) || 5;
     return { kind: 'retry429', retryMs: Math.max(1000, retryAfter * 1000) };
   }
-  const detail =
-    body && typeof body === 'object' && !Array.isArray(body) ? body.detail : null;
-  if (detail && /live f1 session/i.test(String(detail))) {
-    return { kind: 'liveblock', detail: String(detail) };
+
+  // A JSON object carrying a `detail` (OpenF1's error envelope) that is NOT a
+  // live-block — at any status, including a deceptive 200 — is an API error, not
+  // a data array. Route it to the distinct API-error state so it is never parsed
+  // as records and never mistaken for a connectivity problem.
+  if (detail != null) {
+    const msg = typeof detail === 'string' ? detail : JSON.stringify(detail);
+    return { kind: 'error', status, message: msg };
   }
+
   if (status >= 400) {
-    return {
-      kind: 'error',
-      status,
-      message: typeof detail === 'string' ? detail : `Request failed (${status})`,
-    };
+    return { kind: 'error', status, message: `Request failed (${status})` };
   }
+
   return { kind: 'ok', body };
 }

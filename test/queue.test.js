@@ -20,6 +20,34 @@ describe('classifyResponse', () => {
     expect(classifyResponse(200, [{ a: 1 }])).toEqual({ kind: 'ok', body: [{ a: 1 }] });
     expect(classifyResponse(404, { detail: 'nope' }).kind).toBe('error');
   });
+
+  // --- REGRESSION: the reported "Could not reach OpenF1. Check your connection."
+  // bug. During a live block the free tier replies HTTP 200, CORS-enabled, with a
+  // JSON OBJECT {"detail":"Live F1 session in progress..."} — NOT an array, NOT a
+  // 4xx. The classifier must recognise the live block by BODY SHAPE at status 200
+  // so it never reaches array-parsing code (which threw and got mislabeled as a
+  // network/connection failure).
+  it('classifies the exact HTTP 200 live-block object as liveblock (not error, not connection)', () => {
+    const status = 200; // <-- the deceptive part: a 200, not a 4xx
+    const body = { detail: 'Live F1 session in progress. Please try again after the session ends.' };
+    const d = classifyResponse(status, body, null);
+    expect(d.kind).toBe('liveblock');
+    expect(d.detail).toMatch(/live f1 session/i);
+    // It must NOT be an ok/data body and must NOT be a generic api error.
+    expect(d.kind).not.toBe('ok');
+    expect(d.kind).not.toBe('error');
+  });
+
+  it('routes a non-live-block detail OBJECT at 200 to api-error, never ok/connection', () => {
+    const d = classifyResponse(200, { detail: 'Some other server message' }, null);
+    expect(d.kind).toBe('error');
+    expect(d.message).toMatch(/some other server message/i);
+  });
+
+  it('is case-insensitive and tolerant of a longer live-block detail string', () => {
+    const d = classifyResponse(200, { detail: 'LIVE F1 SESSION IN PROGRESS — free access paused until ~30 min after the session.' });
+    expect(d.kind).toBe('liveblock');
+  });
 });
 
 describe('RateLimitedQueue timing', () => {

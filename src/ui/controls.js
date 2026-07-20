@@ -1,6 +1,7 @@
 // UI controls: session picker, transport bar, settings.
 
-import { OpenF1, getApiKey, setApiKey } from '../api/openf1.js';
+import { getApiKey, setApiKey } from '../api/openf1.js';
+import { OpenF1Provider } from '../data/providers/openf1Provider.js';
 import { SPEEDS } from '../engine/clock.js';
 
 // -----------------------------------------------------------------------------
@@ -9,10 +10,13 @@ import { SPEEDS } from '../engine/clock.js';
 // -----------------------------------------------------------------------------
 
 export class SessionPicker {
-  constructor({ onPick, onError }) {
+  constructor({ onPick, onError, source }) {
     this.el = document.getElementById('picker');
     this.onPick = onPick;
     this.onError = onError;
+    // Data source facade (ProviderManager) or provider with getMeetings/
+    // getSessions. Defaults to OpenF1 so the picker works standalone.
+    this.source = source || new OpenF1Provider();
     this.year = new Date().getFullYear();
     this.meetings = [];
     this.selectedMeeting = null;
@@ -79,7 +83,7 @@ export class SessionPicker {
     list.innerHTML = '<div class="pk-loading">Loading race weekends…</div>';
     this._status('');
     try {
-      const meetings = await OpenF1.meetings(year);
+      const meetings = await this.source.getMeetings(year);
       this.meetings = (Array.isArray(meetings) ? meetings : []).sort(
         (a, b) => Date.parse(b.date_start) - Date.parse(a.date_start)
       );
@@ -120,7 +124,7 @@ export class SessionPicker {
     const col = this.el.querySelector('#pk-sessions');
     col.innerHTML = '<div class="pk-loading">Loading…</div>';
     try {
-      const sessions = await OpenF1.sessions({ meeting_key: meetingKey });
+      const sessions = await this.source.getSessions({ meeting_key: meetingKey, _year: this.year });
       this.sessions = (Array.isArray(sessions) ? sessions : []).sort(
         (a, b) => Date.parse(a.date_start) - Date.parse(b.date_start)
       );
@@ -157,7 +161,7 @@ export class SessionPicker {
       if (Date.parse(m.date_start) > now) continue; // future weekend
       let sessions;
       try {
-        sessions = await OpenF1.sessions({ meeting_key: m.meeting_key });
+        sessions = await this.source.getSessions({ meeting_key: m.meeting_key, _year: this.year });
       } catch (e) {
         if (e && e.isLiveBlock) { this.onError && this.onError(e); return; }
         continue;

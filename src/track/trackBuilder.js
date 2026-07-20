@@ -12,7 +12,7 @@
 // The resampled centerline is cached in localStorage per session_key (tiny).
 
 import * as THREE from 'three';
-import { OpenF1 } from '../api/openf1.js';
+import { OpenF1Provider } from '../data/providers/openf1Provider.js';
 import {
   resampleByArcLength, smoothClosed, fitTransform, computeNormals,
   curvature, arcLengths, syntheticOval,
@@ -36,18 +36,23 @@ export function makeTransform(centerRaw, scale) {
   };
 }
 
-// Main entry. Returns { group, transform, centerline, sectors, dispose, meta }.
-export async function buildTrack(store) {
+// Main entry. Returns { group, transform, centerline, centerlineRaw, sectors,
+// dispose, meta }. `source` supplies location telemetry; when it returns null
+// (Approximate mode / no telemetry) the track falls back to a synthetic oval.
+export async function buildTrack(store, source) {
+  const src = source || new OpenF1Provider();
   const cached = loadCached(store.sessionKey);
   let centerRaw, meta;
   if (cached) {
     centerRaw = cached.centerline;
     meta = cached.meta;
   } else {
-    const built = await deriveCenterlineFromData(store);
+    const built = await deriveCenterlineFromData(store, src);
     centerRaw = built.centerline;
     meta = built.meta;
-    saveCached(store.sessionKey, { centerline: centerRaw, meta });
+    // Only cache real (telemetry-derived) centerlines — never the synthetic
+    // oval, so a later live-mode load rebuilds the real circuit.
+    if (!meta.synthetic) saveCached(store.sessionKey, { centerline: centerRaw, meta });
   }
 
   const { center, scale } = fitTransform(centerRaw, SCENE_SIZE);
@@ -80,6 +85,7 @@ export async function buildTrack(store) {
     group,
     transform,
     centerline: pts, // Vector2 in scene space
+    centerlineRaw: centerRaw, // {x,y} in provider-world space (for ApproxBuffer arc)
     startFinish: sf.start,
     sectors, // { setColors(['purple',...], lerp?), reset() }
     dispose,
@@ -89,7 +95,7 @@ export async function buildTrack(store) {
 
 // --- centerline derivation from location data ------------------------------
 
-async function deriveCenterlineFromData(store) {
+async function deriveCenterlineFromData(store, source) {
   const lap = store.fastestLap();
   if (!lap) {
     return { centerline: syntheticOval(), meta: { synthetic: true, startIndex: 0 } };
@@ -102,7 +108,8 @@ async function deriveCenterlineFromData(store) {
 
   let rows = [];
   try {
-    rows = await OpenF1.location(store.sessionKey, startISO, endISO);
+    // null => provider has no telemetry (Approximate mode) => synthetic oval.
+    rows = await source.getLocationWindow(store.session, startISO, endISO);
   } catch (e) {
     if (e && e.isLiveBlock) throw e;
     rows = [];

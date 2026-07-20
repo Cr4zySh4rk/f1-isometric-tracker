@@ -6,13 +6,24 @@ import { IsoRenderer, webglAvailable } from './scene/renderer.js';
 import { CarManager } from './scene/cars.js';
 import { SessionStore } from './data/sessionStore.js';
 import { ReplayBuffer } from './data/replayBuffer.js';
+import { ApproxBuffer } from './data/approxBuffer.js';
 import { PlaybackClock } from './engine/clock.js';
 import { buildTrack } from './track/trackBuilder.js';
 import { Hud } from './ui/hud.js';
 import { DriverPanel } from './ui/driverPanel.js';
 import { SessionPicker, Transport, initSettings } from './ui/controls.js';
 import { LiveBlockError } from './api/openf1.js';
+import { ProviderManager } from './data/providers/manager.js';
+import { OpenF1Provider } from './data/providers/openf1Provider.js';
+import { JolpicaProvider } from './data/providers/jolpicaProvider.js';
 import { focusTrackColors } from './data/timing.js';
+
+// Multi-provider data source with automatic OpenF1 → Jolpica failover and a
+// 60 s recovery poll. Every data call routes through this facade.
+const providers = new ProviderManager({
+  primary: new OpenF1Provider(),
+  fallback: new JolpicaProvider(),
+});
 
 const CAR_GLTF_URL = `${import.meta.env.BASE_URL}assets/car.glb`;
 
@@ -26,6 +37,7 @@ let renderer, carMgr, store, buffer, clock, hud, transport, driverPanel, track;
 let focused = false; // a driver is focused (camera follow + sector track tint)
 let running = false;
 let liveRetryTimer = null;
+let currentSession = null; // for reload on provider recovery
 
 function showLoading(msg) {
   dom.loadingText.textContent = msg || 'Loading…';
@@ -79,11 +91,16 @@ async function boot() {
 
   initSettings({ onChange: () => { /* key changed; live retry will pick it up */ } });
 
+  // React to provider mode changes (OpenF1 ⇄ Jolpica). On recovery, offer to
+  // reload with real telemetry.
+  providers.onModeChange((info) => handleModeChange(info));
+
   const picker = new SessionPicker({
+    source: providers,
     onPick: (session) => loadSession(session),
     onError: (e) => {
       if (e instanceof LiveBlockError || (e && e.isLiveBlock)) {
-        showBanner('Live data restricted (free tier) — session replay is available ~30 min after the flag. Retrying…', 'warn', 'Retry now', () => picker.open(true));
+        showBanner('Live F1 session in progress — free OpenF1 access is paused until ~30 min after the session. Retrying automatically…', 'warn', 'Retry now', () => picker.open(true));
         scheduleLiveRetry(() => picker.open(true));
       }
     },
@@ -103,6 +120,12 @@ async function boot() {
 async function loadSession(session) {
   hideBanner();
   clearLiveRetry();
+  currentSession = session;
+  // A Jolpica-origin session (string 'jol-…' key) can only be served in
+  // Approximate mode; make sure the manager is degraded before we load it.
+  if (isJolpicaSession(session) && providers.mode !== 'approx') {
+    providers.forceApprox('jolpica session');
+  }
   showLoading(`Loading ${session.session_name || 'session'}…`);
 
   // Tear down previous scene objects, disposing GPU resources to avoid leaks.
@@ -111,16 +134,22 @@ async function loadSession(session) {
   if (track) { renderer.remove(track.group); track.dispose && track.dispose(); track = null; }
 
   try {
-    store = new SessionStore(session);
+    store = new SessionStore(session, providers);
     await store.load();
 
-    showLoading('Building the circuit from telemetry…');
-    track = await buildTrack(store);
+    const approx = !providers.telemetry;
+    showLoading(approx ? 'Building an approximate circuit…' : 'Building the circuit from telemetry…');
+    track = await buildTrack(store, providers);
     renderer.add(track.group);
     renderer.frameTrack(track.centerline);
 
-    buffer = new ReplayBuffer(store);
+    // Telemetry present → chunked location replay; otherwise → approximate
+    // lap-time-driven animation along the (synthetic/derived) centerline.
+    buffer = approx
+      ? new ApproxBuffer(store, track.centerlineRaw)
+      : new ReplayBuffer(store, providers);
     buffer.onLiveBlock = (e) => handleLiveBlock(session);
+    if (approx) showApproxBanner();
 
     carMgr = new CarManager(renderer, store, track.transform);
 
@@ -225,6 +254,35 @@ function initClickToFocus() {
   });
 }
 
+function isJolpicaSession(session) {
+  return !!(session && (session._jolpica || String(session.session_key).startsWith('jol-')));
+}
+
+// Persistent "Approximate mode" banner shown whenever the active provider has no
+// telemetry (Jolpica fallback). Cars are estimated from lap times, not live x/y.
+function showApproxBanner() {
+  showBanner(
+    'Approximate mode — live telemetry unavailable. Order, laps and timing are from Jolpica (Ergast); cars are estimated from lap times along a schematic circuit. Checking for OpenF1 every 60 s…',
+    'info'
+  );
+}
+
+// Fired by ProviderManager when the mode flips.
+function handleModeChange(info) {
+  if (info.mode === 'approx') {
+    showApproxBanner();
+  } else {
+    // OpenF1 recovered. If the current session is OpenF1-native (numeric key),
+    // reload it with full telemetry automatically; otherwise offer the picker.
+    if (currentSession && !isJolpicaSession(currentSession)) {
+      showBanner('Live telemetry available again — reloading with full 3D…', 'ok');
+      loadSession(currentSession);
+    } else {
+      showBanner('OpenF1 telemetry available again. Reopen the session picker to load full 3D telemetry.', 'ok', 'Pick session', () => reopenPicker());
+    }
+  }
+}
+
 function handleLiveBlock(session) {
   showBanner(
     'Live data restricted (free tier) — session replay available ~30 min after the flag. Add a paid OpenF1 key in Settings for live mode.',
@@ -247,7 +305,7 @@ function enterLiveMode(session) {
 }
 
 function reopenPicker() {
-  const picker = new SessionPicker({ onPick: loadSession, onError: () => {} });
+  const picker = new SessionPicker({ source: providers, onPick: loadSession, onError: () => {} });
   picker.open(false);
 }
 

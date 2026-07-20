@@ -2,6 +2,7 @@
 
 import { getApiKey, setApiKey } from '../api/openf1.js';
 import { OpenF1Provider } from '../data/providers/openf1Provider.js';
+import { filterAvailableSessions, filterStartedMeetings } from '../data/availability.js';
 import { SPEEDS } from '../engine/clock.js';
 
 // -----------------------------------------------------------------------------
@@ -84,7 +85,8 @@ export class SessionPicker {
     this._status('');
     try {
       const meetings = await this.source.getMeetings(year);
-      this.meetings = (Array.isArray(meetings) ? meetings : []).sort(
+      // Only weekends that have started — fully future ones have no data.
+      this.meetings = filterStartedMeetings(meetings).sort(
         (a, b) => Date.parse(b.date_start) - Date.parse(a.date_start)
       );
       this._renderMeetings();
@@ -125,7 +127,8 @@ export class SessionPicker {
     col.innerHTML = '<div class="pk-loading">Loading…</div>';
     try {
       const sessions = await this.source.getSessions({ meeting_key: meetingKey, _year: this.year });
-      this.sessions = (Array.isArray(sessions) ? sessions : []).sort(
+      // Only sessions whose data is published (ended + ~30 min).
+      this.sessions = filterAvailableSessions(sessions).sort(
         (a, b) => Date.parse(a.date_start) - Date.parse(b.date_start)
       );
       this._renderSessions();
@@ -137,15 +140,12 @@ export class SessionPicker {
 
   _renderSessions() {
     const col = this.el.querySelector('#pk-sessions');
-    if (!this.sessions.length) { col.innerHTML = '<div class="pk-hint">No sessions.</div>'; return; }
-    const now = Date.now();
-    col.innerHTML = this.sessions.map((s) => {
-      const ended = s.date_end && Date.parse(s.date_end) < now;
-      return `<button class="pk-item" data-key="${s.session_key}">
+    if (!this.sessions.length) { col.innerHTML = '<div class="pk-hint">No completed sessions yet — data appears ~30 min after each session ends.</div>'; return; }
+    col.innerHTML = this.sessions.map((s) => `
+      <button class="pk-item" data-key="${s.session_key}">
         <span class="pk-item-name">${escapeHtml(s.session_name || s.session_type || 'Session')}</span>
-        <span class="pk-item-sub">${fmtDate(s.date_start)} ${ended ? '' : '· upcoming/live'}</span>
-      </button>`;
-    }).join('');
+        <span class="pk-item-sub">${fmtDate(s.date_start)}</span>
+      </button>`).join('');
     col.querySelectorAll('.pk-item').forEach((btn) => {
       btn.addEventListener('click', () => {
         const s = this.sessions.find((x) => x.session_key === parseInt(btn.dataset.key, 10));
@@ -166,9 +166,8 @@ export class SessionPicker {
         if (e && e.isLiveBlock) { this.onError && this.onError(e); return; }
         continue;
       }
-      const races = (Array.isArray(sessions) ? sessions : [])
+      const races = filterAvailableSessions(sessions, now)
         .filter((s) => /race/i.test(s.session_name || s.session_type || ''))
-        .filter((s) => s.date_end && Date.parse(s.date_end) < now)
         .sort((a, b) => Date.parse(b.date_start) - Date.parse(a.date_start));
       if (races.length) {
         this.close();

@@ -63,6 +63,22 @@ function hideBanner() {
   dom.banner.classList.add('hidden');
 }
 
+// Small "Buffering…" chip while the playback cursor sits in an unloaded window.
+let bufferingShown = false;
+function setBuffering(on) {
+  if (on === bufferingShown) return;
+  bufferingShown = on;
+  let el = document.getElementById('buffering');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'buffering';
+    el.className = 'buffering hidden';
+    el.textContent = 'Buffering…';
+    document.getElementById('app').appendChild(el);
+  }
+  el.classList.toggle('hidden', !on);
+}
+
 // Transient, self-dismissing notice (does not persist like showBanner). Used for
 // the startup "Latest race" toast so the loaded session never feels random.
 let toastTimer = null;
@@ -106,6 +122,12 @@ async function boot() {
   }
 
   renderer = new IsoRenderer(document.getElementById('scene'));
+  // A manual pan disengages follow (the focused panel stays); re-clicking a car
+  // or pressing F re-engages it.
+  renderer.onFollowBreak = () => {
+    const btn = document.getElementById('follow-btn');
+    btn && btn.classList.remove('active');
+  };
   initClickToFocus();
 
   // If a CC0 car model is bundled at public/assets/car.glb, use it; otherwise
@@ -143,7 +165,13 @@ async function boot() {
   startLoop();
 }
 
+// Generation guard: rapid session switches (double-pick, auto-reload on
+// provider recovery, live-retry timers) must not let an in-flight older load
+// clobber the newer one. Only the latest generation may commit scene state.
+let loadGen = 0;
+
 async function loadSession(session, meta = {}) {
+  const gen = ++loadGen;
   hideBanner();
   clearLiveRetry();
   currentSession = session;
@@ -162,12 +190,20 @@ async function loadSession(session, meta = {}) {
   if (track) { renderer.remove(track.group); track.dispose && track.dispose(); track = null; }
 
   try {
-    store = new SessionStore(session, providers);
-    await store.load();
+    const newStore = new SessionStore(session, providers);
+    await newStore.load();
+    if (gen !== loadGen) return; // a newer load superseded this one
+    store = newStore;
 
     const approx = !providers.telemetry;
     showLoading(approx ? 'Building an approximate circuit…' : 'Building the circuit from telemetry…');
-    track = await buildTrack(store, providers);
+    const newTrack = await buildTrack(store, providers);
+    if (gen !== loadGen) {
+      // Stale: never attach — dispose the GPU resources we just built.
+      newTrack.dispose && newTrack.dispose();
+      return;
+    }
+    track = newTrack;
     renderer.add(track.group);
     renderer.frameTrack(track.centerline);
 
@@ -176,7 +212,9 @@ async function loadSession(session, meta = {}) {
     buffer = approx
       ? new ApproxBuffer(store, track.centerlineRaw)
       : new ReplayBuffer(store, providers);
-    buffer.onLiveBlock = (e) => handleLiveBlock(session);
+    // Gen-guarded: a stale buffer's in-flight fetch must not resurrect banners
+    // or retry timers for a session the user has already switched away from.
+    buffer.onLiveBlock = () => { if (gen === loadGen) handleLiveBlock(session); };
     if (approx) showApproxBanner();
 
     carMgr = new CarManager(renderer, store, track.transform);
@@ -220,6 +258,7 @@ async function loadSession(session, meta = {}) {
       showToast(`Latest race — ${sessionTitle(session)}`, 'ok');
     }
   } catch (e) {
+    if (gen !== loadGen) return; // superseded — its errors are irrelevant
     hideLoading();
     if (e instanceof LiveBlockError || (e && e.isLiveBlock)) {
       handleLiveBlock(session);
@@ -242,8 +281,11 @@ function selectDriver(num, focus = true) {
 function focusDriver(num) {
   focused = true;
   if (driverPanel) driverPanel.show(num);
-  const p = carMgr && carMgr.selectedWorldPos();
-  if (renderer) renderer.setFollow(p || null);
+  // Follow by INTENT, not by momentary availability: the renderer resolves this
+  // function every frame, so follow engages as soon as the car has a sample
+  // (and survives brief gaps — buffering, pits) instead of silently never
+  // engaging when the car happened to be hidden at click time.
+  if (renderer) renderer.setFollow(() => (carMgr ? carMgr.selectedWorldPos() : null));
   const btn = document.getElementById('follow-btn');
   btn && btn.classList.toggle('active', true);
 }
@@ -355,16 +397,20 @@ function startLoop() {
     lastFrame = now;
 
     if (clock && buffer && carMgr) {
+      // Buffering: while the cursor window isn't loaded yet (e.g. a seek far
+      // outside the fetched windows), hold the clock so playback doesn't run
+      // blindly through unfetched data, and show a small indicator. The buffer
+      // keeps fetching/retrying via update(), so this can't get stuck.
+      const buffered = !buffer.isCursorBuffered || buffer.isCursorBuffered(clock.t);
+      if (!buffered && clock.playing && !clock.live) clock.hold(now);
+      setBuffering(!buffered);
+
       const t = clock.tick(now);
       buffer.update(t);
       const samples = buffer.sampleAll(t);
       carMgr.update(samples, dt, t);
 
-      // Follow selected driver.
-      if (renderer.followEnabled) {
-        const p = carMgr.selectedWorldPos();
-        if (p) renderer.setFollow(p);
-      }
+      // (Camera follow is resolved inside renderer.update() every frame.)
 
       if (hud) hud.render(t);
       if (driverPanel) driverPanel.update(t);
@@ -393,10 +439,10 @@ function toggleFollow() {
   if (renderer.followEnabled) {
     renderer.setFollow(null);
     btn && btn.classList.remove('active');
-  } else {
-    const p = carMgr.selectedWorldPos();
-    renderer.setFollow(p);
-    btn && btn.classList.toggle('active', !!p);
+  } else if (carMgr.selected != null) {
+    // Engage by intent — works even while the selected car is briefly hidden.
+    renderer.setFollow(() => (carMgr ? carMgr.selectedWorldPos() : null));
+    btn && btn.classList.add('active');
   }
 }
 

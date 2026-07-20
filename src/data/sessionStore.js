@@ -81,8 +81,13 @@ export class SessionStore {
 
     for (const d of this.drivers) this.driversByNumber.set(d.driver_number, d);
 
-    if (!cachedDrivers && this.drivers.length) lsSet(`drivers.${k}`, this.drivers);
-    if (!cachedLaps && this.laps.length) lsSet(`laps.${k}`, this.laps);
+    // Only cache once the session has settled (ended > 1 h ago): caching a
+    // still-running / freshly-finished session would freeze partial laps and
+    // drivers in localStorage and serve them stale forever.
+    const endMs = Date.parse(s.date_end);
+    const settled = isFinite(endMs) && Date.now() - endMs > 60 * 60000;
+    if (settled && !cachedDrivers && this.drivers.length) lsSet(`drivers.${k}`, this.drivers);
+    if (settled && !cachedLaps && this.laps.length) lsSet(`laps.${k}`, this.laps);
 
     this._loaded = true;
     return this;

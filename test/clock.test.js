@@ -52,4 +52,20 @@ describe('PlaybackClock', () => {
     expect(SPEEDS).toContain(1);
     expect(SPEEDS[0]).toBe(0.5);
   });
+
+  it('hold() freezes T for the frame without pausing (buffering)', () => {
+    const c = new PlaybackClock({ start: 0, end: 100000 });
+    c.play();
+    c.tick(0);
+    c.tick(1000);
+    expect(c.t).toBe(1000);
+    // Cursor window not buffered: hold each frame → T must not advance.
+    c.hold(2000);
+    expect(c.tick(2000)).toBe(1000);
+    c.hold(3000);
+    expect(c.tick(3000)).toBe(1000);
+    expect(c.playing).toBe(true); // still nominally playing
+    // Buffered again → resumes advancing from the same T.
+    expect(c.tick(4000)).toBe(2000);
+  });
 });

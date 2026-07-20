@@ -55,8 +55,13 @@ export class Hud {
     this.elClock = this.elTower.querySelector('#tw-clock');
     this.elStatus = this.elTower.querySelector('#tw-status');
 
-    // Event delegation: row click selects driver; status/delta header toggles.
-    this.elRows.addEventListener('click', (e) => {
+    // Event delegation: row press selects driver; status/delta header toggles.
+    // Selection listens on POINTERDOWN, not 'click': rows are rebuilt every
+    // ~120 ms of session time (every frame at high replay speeds), so a click
+    // whose pointerdown/up straddle a rebuild retargets to the container and
+    // `closest('.tw-row')` misses — making tower clicks silently unreliable.
+    // pointerdown always targets the live row the user actually pressed.
+    this.elRows.addEventListener('pointerdown', (e) => {
       const row = e.target.closest('.tw-row');
       if (row && row.dataset.num != null) {
         this.onSelectDriver && this.onSelectDriver(parseInt(row.dataset.num, 10));

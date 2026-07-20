@@ -58,7 +58,10 @@ export function setApiKey(key) {
 
 // --- throttled queue -------------------------------------------------------
 
-const queue = new RateLimitedQueue({ perSec: 3, perMin: 30 });
+// Limits are overridable via a global hook for offline test harnesses that
+// replay disk-cached responses (they throttle REAL network fetches themselves,
+// at the fetch layer). In the browser the hook is undefined → real limits.
+const queue = new RateLimitedQueue(globalThis.__OF1_QUEUE_OPTS || { perSec: 3, perMin: 30 });
 
 // Observers can watch queue depth / pause state (used by a subtle UI indicator).
 export function onQueueChange(fn) {

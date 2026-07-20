@@ -21,9 +21,27 @@ globalThis.localStorage = {
 };
 
 // Disk-cache fetch so reruns don't hammer the rate limit.
+//
+// Rate limiting lives HERE (only REAL network fetches count): the app's
+// in-process queue is opened wide via the __OF1_QUEUE_OPTS hook below, so
+// disk-cached replays are instant and reruns resume where the cache ends —
+// otherwise cached replays would eat the 30/min budget and a warm rerun would
+// stall on the queue before reaching the first genuinely new request.
+globalThis.__OF1_QUEUE_OPTS = { perSec: 1000, perMin: 60000 };
+
 const CACHE_DIR = '/tmp/of1cache';
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 const realFetch = globalThis.fetch;
+const _netTimes = []; // timestamps of real network fetches
+async function throttleRealFetch() {
+  for (;;) {
+    const now = Date.now();
+    while (_netTimes.length && now - _netTimes[0] > 60000) _netTimes.shift();
+    const lastSec = _netTimes.filter((t) => now - t < 1000).length;
+    if (_netTimes.length < 30 && lastSec < 3) { _netTimes.push(now); return; }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+}
 globalThis.fetch = async (url, opts) => {
   const key = crypto.createHash('sha1').update(String(url)).digest('hex');
   const f = path.join(CACHE_DIR, key + '.json');
@@ -33,12 +51,16 @@ globalThis.fetch = async (url, opts) => {
     const status = fs.existsSync(meta) ? parseInt(fs.readFileSync(meta, 'utf8'), 10) : 200;
     return new Response(body, { status, headers: { 'content-type': 'application/json' } });
   }
+  await throttleRealFetch();
   const res = await realFetch(url, opts);
   const text = await res.text();
-  // Cache ALL statuses (incl. 404 "No results found") so reruns are fast and the
-  // rate-limited queue isn't re-hit for known-empty windows.
-  fs.writeFileSync(f, text);
-  fs.writeFileSync(meta, String(res.status));
+  // Cache 200/404 (a 404 is OpenF1's "No results found" — a legitimately empty
+  // window). NEVER cache 429/5xx: replaying a cached 429 would spin the
+  // client's retry loop forever.
+  if (res.status === 200 || res.status === 404) {
+    fs.writeFileSync(f, text);
+    fs.writeFileSync(meta, String(res.status));
+  }
   return new Response(text, { status: res.status, headers: res.headers });
 };
 
@@ -88,6 +110,37 @@ function bboxOf(centerline) {
   return { minx, maxx, minz, maxz };
 }
 
+// Follow-camera assertion: replicate the renderer's per-frame follow math
+// (target.lerp(carScenePos, 0.12)) against REAL sampled telemetry and assert
+// the camera target converges onto the selected driver's scene position and
+// stays inside the track's coordinate frame. This is exactly what
+// IsoRenderer.update() does with the intent function from main.focusDriver().
+function followCameraCheck(track, buffer, fromMs, bb) {
+  const t0 = fromMs;
+  const first = buffer.sampleAll(t0);
+  let num = null;
+  for (const [n, s] of first) { if (s.present) { num = n; break; } }
+  if (num == null) return { ok: false, why: 'no present driver to follow' };
+
+  const cam = { x: 0, z: 0 }; // camera look-target (scene coords)
+  let car = null;
+  const FRAME = 1000 / 60;
+  for (let f = 0; f < 600; f++) { // 10 s of session time at 60 fps
+    const t = t0 + f * FRAME;
+    const s = buffer.sampleAll(t).get(num);
+    if (!s) continue; // gap → follow holds (matches renderer behavior)
+    car = track.transform.toScene(s.x, s.y);
+    cam.x += (car.x - cam.x) * 0.12;
+    cam.z += (car.z - cam.z) * 0.12;
+  }
+  if (!car) return { ok: false, why: 'driver lost during follow window' };
+  const dist = Math.hypot(cam.x - car.x, cam.z - car.z);
+  const inFrame = cam.x >= bb.minx - 20 && cam.x <= bb.maxx + 20 && cam.z >= bb.minz - 20 && cam.z <= bb.maxz + 20;
+  // Steady-state lerp lag behind a moving car is well under 2 scene units.
+  const ok = dist < 3 && inFrame;
+  return { ok, num, dist, inFrame };
+}
+
 async function runSession(label, session) {
   console.log(`\n=== ${label} : session_key=${session.session_key} (${session.circuit_short_name}) ===`);
   const store = new SessionStore(session, providers);
@@ -126,7 +179,19 @@ async function runSession(label, session) {
     console.log(`  T+${offset/1000}s win=${st} sampled=${present} finite=${finite} withinBBox=${within}` +
       (outCount ? ` OUTLIERS=${outCount} ${JSON.stringify(outliers)}` : ''));
   }
-  return { synthetic, results, bb };
+
+  // Follow-camera assertion over real frames at the last sampled offset.
+  let follow = { ok: false, why: 'skipped (synthetic track)' };
+  if (!synthetic) {
+    const T = startMs + OFFSETS[OFFSETS.length - 1];
+    await awaitWindows(buffer, T);
+    await awaitWindows(buffer, T + 10000); // follow window spans ~10 s
+    follow = followCameraCheck(track, buffer, T, bb);
+    console.log(`  follow-camera: ok=${follow.ok}` +
+      (follow.num != null ? ` driver=${follow.num} lag=${follow.dist.toFixed(2)}u inFrame=${follow.inFrame}` : ` (${follow.why})`));
+  }
+
+  return { synthetic, results, bb, follow };
 }
 
 // Pick two real completed races from 2026 (a genuine session switch across
@@ -140,9 +205,10 @@ if (!british || !austria) {
   process.exit(1);
 }
 
-function verdict(r) {
-  const ok = !r.synthetic && Object.values(r.results).some((x) => x.within >= 15 && x.finite === x.present);
-  return ok ? 'PASS' : 'FAIL';
+function verdict(r, { minWithin = 15 } = {}) {
+  const cars = !r.synthetic && Object.values(r.results).some((x) => x.within >= minWithin && x.finite === x.present);
+  const follow = !!(r.follow && r.follow.ok);
+  return cars && follow ? 'PASS' : `FAIL(cars=${cars} follow=${follow})`;
 }
 
 const r1 = await runSession('British GP (Silverstone) Race', british);
@@ -153,6 +219,22 @@ const lines = [`British: ${verdict(r1)}`, `Austria(switch): ${verdict(r2)}`];
 if (!process.env.HARNESS_FAST) {
   const r3 = await runSession('British GP again — SWITCH BACK', british);
   lines.push(`British(switch back): ${verdict(r3)}`);
+
+  // A qualifying session exercises the practice/quali paths (no intervals feed,
+  // sparser presence — cars trickle out of the garage, so sample mid-session
+  // and accept fewer cars on track).
+  const quali = sess.find((s) => s.meeting_key === british.meeting_key && /qualifying/i.test(s.session_name || ''))
+    || sess.find((s) => /qualifying/i.test(s.session_name || ''));
+  if (quali) {
+    const saved = OFFSETS.slice();
+    OFFSETS.length = 0; OFFSETS.push(600000, 900000);
+    const r4 = await runSession('British GP Qualifying', quali);
+    OFFSETS.length = 0; OFFSETS.push(...saved);
+    lines.push(`British quali: ${verdict(r4, { minWithin: 8 })}`);
+  } else {
+    lines.push('British quali: SKIP (no quali session found)');
+  }
 }
 console.log('\n--- VERDICT ---');
 console.log(lines.join('\n'));
+if (lines.some((l) => l.includes('FAIL'))) process.exit(1);

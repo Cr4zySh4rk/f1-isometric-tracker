@@ -61,11 +61,20 @@ export class ProviderManager {
 
   // Run an operation `fn(provider)` on the active provider, failing over to the
   // fallback (and switching to Approximate mode) on a live-block / network error.
+  // A SINGLE transient network blip does not demote: the call is retried once on
+  // the primary first, and only a second consecutive failure triggers failover.
   async run(fn, { reason = 'request failed' } = {}) {
     try {
       return await fn(this.active);
     } catch (err) {
       if (this.mode === MODE_LIVE && this.fallback && isFailoverError(err)) {
+        if (err.isNetwork && !err.isLiveBlock) {
+          try {
+            return await fn(this.active); // one retry on the primary
+          } catch (err2) {
+            if (!isFailoverError(err2)) throw err2;
+          }
+        }
         this._demote(err.isLiveBlock ? 'live-block' : reason);
         return await fn(this.active); // active is now the fallback
       }

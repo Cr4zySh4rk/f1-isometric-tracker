@@ -179,6 +179,18 @@ function setOpacity(car, a) {
   if (car.ring && car.ring.material) car.ring.material.opacity = a * 0.9;
 }
 
+// Invisible-but-raycastable click proxy: at track-wide zoom a car body is only
+// ~15 px on screen (and moving), so picking the exact geometry is near
+// impossible. The proxy gives each car a generous, stable hit cylinder without
+// drawing anything (colorWrite/depthWrite off ⇒ no pixels, no depth impact).
+function makeHitProxy() {
+  const mat = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false });
+  const hit = new THREE.Mesh(new THREE.CylinderGeometry(4.2, 4.2, 8, 8), mat);
+  hit.position.y = 3;
+  hit.name = 'hit-proxy';
+  return hit;
+}
+
 function lerpAngle(a, b, t) {
   let d = b - a;
   while (d > Math.PI) d -= Math.PI * 2;
@@ -269,6 +281,8 @@ function buildCar(teamColor) {
   ring.visible = false;
   group.add(ring);
 
+  group.add(makeHitProxy());
+
   group.scale.setScalar(1.1);
   return { group, bodyMat, allMats, wheels, ring };
 }
@@ -312,6 +326,7 @@ function buildCarFromGLTF(teamColor) {
   ring.position.y = 0.12;
   ring.visible = false;
   group.add(ring);
+  group.add(makeHitProxy());
   return { group, bodyMat: allMats[0], allMats, wheels: [], ring };
 }
 

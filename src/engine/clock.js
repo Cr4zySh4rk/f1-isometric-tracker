@@ -84,6 +84,13 @@ export class PlaybackClock {
     this._emit('live');
   }
 
+  // Hold playback for this frame without pausing: resets the wall reference so
+  // the next tick() advances T by ~0. Used while the cursor window is still
+  // buffering, so the clock doesn't run through unfetched data.
+  hold(wallNow) {
+    this._lastWall = wallNow;
+  }
+
   // Advance the clock. `wallNow` is a monotonic ms timestamp (performance.now()).
   tick(wallNow) {
     if (this.live) {

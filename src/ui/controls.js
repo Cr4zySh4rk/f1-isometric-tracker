@@ -243,13 +243,17 @@ export class Transport {
       });
     }
 
-    // keyboard: space = play/pause, arrows = seek
-    window.addEventListener('keydown', (e) => {
+    // keyboard: space = play/pause, arrows = seek. A Transport is rebuilt on
+    // every session switch — remove the previous instance's window listener so
+    // handlers (and their old clocks) don't accumulate.
+    if (Transport._keyHandler) window.removeEventListener('keydown', Transport._keyHandler);
+    Transport._keyHandler = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.code === 'Space') { e.preventDefault(); this.clock.toggle(); }
       else if (e.code === 'ArrowRight') this.clock.seek(this.clock.t + 5000);
       else if (e.code === 'ArrowLeft') this.clock.seek(this.clock.t - 5000);
-    });
+    };
+    window.addEventListener('keydown', Transport._keyHandler);
   }
 
   _sync() {

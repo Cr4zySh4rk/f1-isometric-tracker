@@ -53,10 +53,39 @@ describe('ProviderManager failover', () => {
     m.stopRecoveryPoll();
   });
 
-  it('fails over on a genuine network error', async () => {
-    const primary = makePrimary({ getDrivers: async () => { throw network(); } });
+  it('fails over on a persistent network error (after one primary retry)', async () => {
+    let calls = 0;
+    const primary = makePrimary({ getDrivers: async () => { calls++; throw network(); } });
     const m = new ProviderManager({ primary, fallback: makeFallback() });
     const d = await m.getDrivers({});
+    expect(calls).toBe(2); // original + one retry before demoting
+    expect(m.mode).toBe(MODE_APPROX);
+    expect(d[0].src).toBe('jolpica');
+    m.stopRecoveryPoll();
+  });
+
+  it('a SINGLE transient network blip does NOT demote — the retried primary call succeeds', async () => {
+    let calls = 0;
+    const primary = makePrimary({
+      getDrivers: async () => {
+        calls++;
+        if (calls === 1) throw network();
+        return [{ driver_number: 1, src: 'openf1' }];
+      },
+    });
+    const m = new ProviderManager({ primary, fallback: makeFallback() });
+    const d = await m.getDrivers({});
+    expect(d[0].src).toBe('openf1');
+    expect(m.mode).toBe(MODE_LIVE); // still live — no spurious Approximate mode
+    expect(m.telemetry).toBe(true);
+  });
+
+  it('live-block still demotes immediately (no pointless primary retry)', async () => {
+    let calls = 0;
+    const primary = makePrimary({ getDrivers: async () => { calls++; throw liveBlock(); } });
+    const m = new ProviderManager({ primary, fallback: makeFallback() });
+    const d = await m.getDrivers({});
+    expect(calls).toBe(1);
     expect(m.mode).toBe(MODE_APPROX);
     expect(d[0].src).toBe('jolpica');
     m.stopRecoveryPoll();

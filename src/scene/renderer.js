@@ -30,8 +30,12 @@ export class IsoRenderer {
     this.camDistance = 400;
     this.frustumSize = 260; // world units visible vertically (zoom)
     this.target = new THREE.Vector3(0, 0, 0);
-    this.followTarget = null; // Vector3 or null
+    // Follow target: a Vector3, a FUNCTION returning the current Vector3 (or
+    // null while the car has no sample — follow stays engaged and re-acquires
+    // as soon as the function yields a position again), or null (disengaged).
+    this.followTarget = null;
     this.followEnabled = false;
+    this.onFollowBreak = null; // called when a manual pan disengages follow
 
     const aspect = this._aspect();
     this.camera = new THREE.OrthographicCamera(
@@ -152,9 +156,24 @@ export class IsoRenderer {
   add(obj) { this.scene.add(obj); }
   remove(obj) { this.scene.remove(obj); }
 
-  setFollow(worldVec3OrNull) {
-    this.followTarget = worldVec3OrNull;
-    this.followEnabled = !!worldVec3OrNull;
+  setFollow(targetOrNull) {
+    this.followTarget = targetOrNull;
+    this.followEnabled = !!targetOrNull;
+  }
+
+  // Resolve the follow target to a concrete position (or null right now).
+  _followPos() {
+    const t = this.followTarget;
+    if (!t) return null;
+    return typeof t === 'function' ? (t() || null) : t;
+  }
+
+  // A manual pan disengages follow (clicking a car re-engages it in main.js).
+  _breakFollow() {
+    if (!this.followEnabled) return;
+    this.followEnabled = false;
+    this.followTarget = null;
+    if (this.onFollowBreak) this.onFollowBreak();
   }
 
   frameTrack(centerlineVec2) {
@@ -210,9 +229,10 @@ export class IsoRenderer {
       this._applyZoom();
     }, { passive: false });
 
+    let panDist = 0; // cumulative drag distance (px) — a click is not a pan
     el.addEventListener('pointerdown', (e) => {
       dragging = true;
-      this.followEnabled = false; // manual pan breaks follow
+      panDist = 0;
       lastX = e.clientX; lastY = e.clientY;
       el.setPointerCapture(e.pointerId);
       updateBasis();
@@ -222,6 +242,10 @@ export class IsoRenderer {
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
+      // Only a REAL pan (beyond click jitter, single pointer) breaks follow —
+      // a plain click on a car must not disengage the follow it re-engages.
+      panDist += Math.hypot(dx, dy);
+      if (panDist > 5 && this._pointers.size < 2) this._breakFollow();
       const worldPerPx = this.frustumSize / (this.canvas.clientHeight || 1);
       const move = new THREE.Vector3()
         .addScaledVector(worldRight, -dx * worldPerPx)
@@ -257,9 +281,15 @@ export class IsoRenderer {
   }
 
   update() {
-    if (this.followEnabled && this.followTarget) {
-      this.target.lerp(this.followTarget, 0.12);
-      this._placeCamera();
+    if (this.followEnabled) {
+      // Function targets are resolved every frame; a null result (car briefly
+      // has no sample — buffering, pit, coverage gap) keeps follow engaged and
+      // the camera simply holds until the position comes back.
+      const p = this._followPos();
+      if (p) {
+        this.target.lerp(p, 0.12);
+        this._placeCamera();
+      }
     }
   }
 

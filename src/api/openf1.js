@@ -152,6 +152,10 @@ export function buildUrl(path, params) {
   const parts = [];
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null) continue;
+    // Keys starting with "_" are internal hints for other providers (e.g. the
+    // session picker's `_year` used by the Jolpica mapper) — never send them
+    // to OpenF1: unknown filters make the API 404 with "No results found."
+    if (k.startsWith('_')) continue;
     if (OP_KEYS[k]) {
       // Emit the operator inline: `date>VALUE`. ISO datetimes are URL-safe
       // apart from `+` (timezone) and `:`; we keep `:`/`-`/`.`/`T` raw as the

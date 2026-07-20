@@ -171,7 +171,7 @@ export class SessionPicker {
         .sort((a, b) => Date.parse(b.date_start) - Date.parse(a.date_start));
       if (races.length) {
         this.close();
-        this.onPick(races[0]);
+        this.onPick(races[0], { auto: true });
         return;
       }
     }

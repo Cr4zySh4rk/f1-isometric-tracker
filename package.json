@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify:real": "node test/harness/realPipeline.mjs"
   },
   "license": "MIT",
   "dependencies": {

@@ -104,16 +104,48 @@ export class ReplayBuffer {
     const { start, end } = this.windowRange(idx);
     const sISO = new Date(start).toISOString();
     const eISO = new Date(end).toISOString();
+    const sess = this.store.session;
     try {
-      const sess = this.store.session;
-      const jobs = [this.source.getLocationWindow(sess, sISO, eISO)];
-      if (this.isRace) jobs.push(this.source.getIntervals(sess, sISO, eISO));
-      const [loc, ivals] = await Promise.all(jobs);
-      this._ingestLocation(loc);
-      if (ivals) this._ingestIntervals(ivals);
+      // Location and intervals are fetched INDEPENDENTLY. Intervals legitimately
+      // return 404 "No results found" in the first ~90 s of a race (no gaps
+      // exist yet) and intermittently elsewhere; a failed intervals feed must
+      // never discard the location samples (which is what a shared Promise.all
+      // rejection did — leaving the cursor window in 'error' and every car
+      // invisible at the default start-of-race cursor).
+      const [locRes, ivRes] = await Promise.allSettled([
+        this.source.getLocationWindow(sess, sISO, eISO),
+        this.isRace ? this.source.getIntervals(sess, sISO, eISO) : Promise.resolve(null),
+      ]);
+
+      // A live-block on either feed pauses the whole session (free-tier window).
+      const lb = liveBlockOf(locRes) || liveBlockOf(ivRes);
+      if (lb) {
+        this.windows.set(idx, 'liveblock');
+        if (this.onLiveBlock) this.onLiveBlock(lb);
+        return;
+      }
+
+      // Location is required. A genuine (network / transient) failure marks the
+      // window 'error' so update() can retry it later. An OpenF1 "No results
+      // found" (404) is NOT a failure — it is a legitimately empty window (e.g.
+      // a coverage gap), so we ingest nothing and mark it 'loaded' rather than
+      // hammering the rate-limited queue re-requesting it forever.
+      if (locRes.status === 'rejected') {
+        if (!isNoResults(locRes.reason)) {
+          this.windows.set(idx, 'error');
+          return;
+        }
+      } else {
+        this._ingestLocation(locRes.value);
+      }
+
+      // Intervals are optional: ingest when present, ignore any failure.
+      if (ivRes.status === 'fulfilled' && ivRes.value) this._ingestIntervals(ivRes.value);
+
       this.windows.set(idx, 'loaded');
       if (this.onProgress) this.onProgress();
     } catch (err) {
+      // Defensive: an unexpected throw outside allSettled.
       if (err instanceof LiveBlockError || (err && err.isLiveBlock)) {
         this.windows.set(idx, 'liveblock');
         if (this.onLiveBlock) this.onLiveBlock(err);
@@ -182,6 +214,22 @@ export class ReplayBuffer {
     }
     return out;
   }
+}
+
+// A settled promise that rejected with a live-block → the LiveBlockError, else null.
+function liveBlockOf(res) {
+  return res && res.status === 'rejected' && res.reason && res.reason.isLiveBlock
+    ? res.reason
+    : null;
+}
+
+// True when an error represents OpenF1's "No results found" (HTTP 404) — an
+// EMPTY result set, not a transient failure. A genuine network error (isNetwork)
+// is retryable and must NOT be treated as empty.
+export function isNoResults(err) {
+  if (!err || err.isLiveBlock || err.isNetwork) return false;
+  if (err.status === 404) return true;
+  return /no results found/i.test(err.message || '');
 }
 
 export { WINDOW_MS };

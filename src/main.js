@@ -63,6 +63,32 @@ function hideBanner() {
   dom.banner.classList.add('hidden');
 }
 
+// Transient, self-dismissing notice (does not persist like showBanner). Used for
+// the startup "Latest race" toast so the loaded session never feels random.
+let toastTimer = null;
+function showToast(msg, kind = 'ok', ms = 5000) {
+  showBanner(msg, kind);
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { hideBanner(); toastTimer = null; }, ms);
+}
+
+// Human-readable session title for the top bar, e.g. "2026 Silverstone — Race".
+// Composed from the session metadata so the HUD always shows exactly what loaded.
+function sessionTitle(session) {
+  if (!session) return 'F1 Session';
+  const yr = session.year || (session.date_start ? new Date(session.date_start).getUTCFullYear() : '');
+  const place = session.circuit_short_name || session.location || session.country_name || 'Session';
+  const name = session.session_name || session.session_type || 'Session';
+  return `${yr ? yr + ' ' : ''}${place} — ${name}`.trim();
+}
+
+function setSessionTitle(session) {
+  const el = document.getElementById('session-name');
+  const title = sessionTitle(session);
+  if (el) el.textContent = title;
+  document.title = `${title} · F1 Isometric Tracker`;
+}
+
 // Is the session currently inside its "live window" (30 min pre → 30 min post)?
 function inLiveWindow(session) {
   const start = Date.parse(session.date_start);
@@ -97,7 +123,7 @@ async function boot() {
 
   const picker = new SessionPicker({
     source: providers,
-    onPick: (session) => loadSession(session),
+    onPick: (session, meta) => loadSession(session, meta),
     onError: (e) => {
       if (e instanceof LiveBlockError || (e && e.isLiveBlock)) {
         showBanner('Live F1 session in progress — free OpenF1 access is paused until ~30 min after the session. Retrying automatically…', 'warn', 'Retry now', () => picker.open(true));
@@ -117,10 +143,12 @@ async function boot() {
   startLoop();
 }
 
-async function loadSession(session) {
+async function loadSession(session, meta = {}) {
   hideBanner();
   clearLiveRetry();
   currentSession = session;
+  // Always reflect the loaded session in the top bar so it never feels random.
+  setSessionTitle(session);
   // A Jolpica-origin session (string 'jol-…' key) can only be served in
   // Approximate mode; make sure the manager is degraded before we load it.
   if (isJolpicaSession(session) && providers.mode !== 'approx') {
@@ -185,6 +213,12 @@ async function loadSession(session) {
     clock.play();
 
     hideLoading();
+
+    // Startup auto-load: a transient toast reassures the user which session was
+    // chosen (the newest completed race) so it never feels random.
+    if (meta.auto && !approx) {
+      showToast(`Latest race — ${sessionTitle(session)}`, 'ok');
+    }
   } catch (e) {
     hideLoading();
     if (e instanceof LiveBlockError || (e && e.isLiveBlock)) {

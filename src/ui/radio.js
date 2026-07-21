@@ -14,7 +14,7 @@
 // The pure clip-selection logic (normalise / latest-≤-T / list-≤-T) lives in
 // data/radio.js and is unit-tested; this module is the thin DOM/audio shell.
 
-import { normalizeClips, latestClipAtOrBefore, clipsUpTo } from '../data/radio.js';
+import { normalizeClips, clipsForList, clipToAutoplay } from '../data/radio.js';
 
 const LS_MUTE = 'f1iso.radio.muted';
 
@@ -44,20 +44,25 @@ export class RadioController {
 
     this.muted = readMute();
     this.playingUrl = null;
+    this.status = 'idle'; // 'idle' | 'loading' | 'playing' | 'error'
     this.needsGesture = false; // autoplay blocked → offer a tap-to-play
 
-    // The <audio> lives OFF the DOM as a JS property, so re-rendering the clip
-    // list (which rebuilds el.innerHTML) never tears down active playback.
-    this.audio = new Audio();
-    this.audio.preload = 'none';
-    this.audio.muted = this.muted;
+    // A real, DOM-attached <audio> element. Some browsers are flaky playing an
+    // off-DOM Audio() object created via `new Audio()`; a hidden element in the
+    // document plays reliably. It stays alive across clip-list re-renders because
+    // it lives here (not inside the mount we rebuild).
+    this.audio = document.createElement('audio');
+    this.audio.preload = 'metadata';
+    this.audio.hidden = true;
+    // Do NOT set crossOrigin: the F1 mp3 host has no CORS headers, so a plain
+    // media load works but a CORS/anonymous request would be blocked.
+    try { document.body.appendChild(this.audio); } catch { /* non-DOM env (tests) */ }
+    this.audio.addEventListener('playing', () => { this.status = 'playing'; this.render(this._lastT); });
     this.audio.addEventListener('ended', () => {
-      this.playingUrl = null;
-      this.render(this._lastT);
+      this.status = 'idle'; this.playingUrl = null; this.render(this._lastT);
     });
     this.audio.addEventListener('error', () => {
-      this.playingUrl = null;
-      this.render(this._lastT);
+      this.status = 'error'; this.playingUrl = null; this.render(this._lastT);
     });
   }
 
@@ -84,8 +89,8 @@ export class RadioController {
     this.needsGesture = false;
     this._lastT = tMs;
     if (userGesture && !this.muted) {
-      const latest = latestClipAtOrBefore(this.clips, tMs);
-      if (latest) { this._play(latest.url, tMs); return; }
+      const pick = clipToAutoplay(this.clips, tMs);
+      if (pick) { this._play(pick.url, tMs); return; }
     }
     this.render(tMs);
   }
@@ -105,7 +110,10 @@ export class RadioController {
     this.needsGesture = false;
     if (this.el) this.el.innerHTML = '';
   }
-  dispose() { this.stop(); this.audio.src = ''; }
+  dispose() {
+    this.stop();
+    try { this.audio.src = ''; this.audio.remove(); } catch { /* ignore */ }
+  }
 
   toggleMute() {
     this.muted = !this.muted;
@@ -116,22 +124,26 @@ export class RadioController {
   }
 
   playLatest() {
-    const latest = latestClipAtOrBefore(this.clips, this._lastT);
-    if (latest) this._play(latest.url);
+    const pick = clipToAutoplay(this.clips, this._lastT);
+    if (pick) this._play(pick.url);
   }
 
   _play(url, tMs = this._lastT) {
     if (!url) return;
     this.needsGesture = false;
     this.playingUrl = url;
-    this.audio.muted = this.muted;
-    if (this.audio.src !== url) this.audio.src = url;
-    else this.audio.currentTime = 0;
+    this.status = 'loading';
+    // A manual play is always unmuted (the mute toggle only governs AUTOplay);
+    // if the user clicked a clip they clearly want to hear it.
+    this.audio.muted = false;
+    if (this.audio.src !== url) { this.audio.src = url; this.audio.load(); }
+    else { this.audio.currentTime = 0; }
     const p = this.audio.play();
     if (p && p.catch) {
       p.catch(() => {
         // Autoplay blocked (no gesture) — offer tap-to-play, no error surfaced.
         this.needsGesture = true;
+        this.status = 'idle';
         this.playingUrl = null;
         this.render(this._lastT);
       });
@@ -142,6 +154,7 @@ export class RadioController {
   _stopAudio() {
     try { this.audio.pause(); } catch { /* ignore */ }
     this.playingUrl = null;
+    this.status = 'idle';
   }
 
   render(tMs = this._lastT) {
@@ -149,31 +162,37 @@ export class RadioController {
     // Hidden entirely in Approximate mode (no radio feed).
     if (!this.store.hasTelemetry() || this.num == null) { this.el.innerHTML = ''; return; }
 
-    const list = clipsUpTo(this.clips, tMs); // most-recent first
+    const list = clipsForList(this.clips, tMs); // whole session, most-recent first
     const muteLabel = this.muted ? '🔇 Muted' : '🔊 Sound';
     const rows = list.length
       ? list.map((c) => {
           const playing = c.url === this.playingUrl;
-          return `<button class="dp-clip${playing ? ' playing' : ''}" data-radio="clip" data-url="${c.url}" title="Play radio clip">
-            <span class="dp-clip-dot">${playing ? '▶' : '▷'}</span>
+          const loading = playing && this.status === 'loading';
+          const icon = loading ? '⏳' : (playing ? '▶' : '▷');
+          return `<button class="dp-clip${playing ? ' playing' : ''}${c.upcoming ? ' upcoming' : ''}" data-radio="clip" data-url="${c.url}" title="${c.upcoming ? 'Upcoming radio clip' : 'Play radio clip'}">
+            <span class="dp-clip-dot">${icon}</span>
             <span class="dp-clip-t">${clockLabel(c.t - this.startMs)}</span>
+            ${c.upcoming ? '<span class="dp-clip-up">↑</span>' : ''}
           </button>`;
         }).join('')
-      : '<div class="dp-clip-empty">No team radio yet at this point.</div>';
+      : '<div class="dp-clip-empty">No team radio for this driver.</div>';
 
     const gestureHint = this.needsGesture
-      ? '<div class="dp-radio-tap" data-radio="latest">Tap to play latest radio</div>'
+      ? '<div class="dp-radio-tap" data-radio="latest">Tap to play radio</div>'
+      : '';
+    const errHint = this.status === 'error'
+      ? '<div class="dp-radio-err">Couldn’t play that clip.</div>'
       : '';
 
     this.el.innerHTML = `
       <div class="dp-radio-head">
         <span class="dp-radio-title">TEAM RADIO</span>
         <div class="dp-radio-ctl">
-          <button class="dp-radio-btn" data-radio="mute" title="Mute/unmute (persisted)">${muteLabel}</button>
-          <button class="dp-radio-btn" data-radio="latest" title="Play latest clip ≤ now">▷ Latest</button>
+          <button class="dp-radio-btn" data-radio="mute" title="Mute/unmute auto-play (persisted)">${muteLabel}</button>
+          <button class="dp-radio-btn" data-radio="latest" title="Play the most recent clip">▷ Play</button>
         </div>
       </div>
-      ${gestureHint}
+      ${gestureHint}${errHint}
       <div class="dp-clips">${rows}</div>`;
   }
 }

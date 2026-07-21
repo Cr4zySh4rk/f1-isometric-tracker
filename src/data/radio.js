@@ -35,3 +35,24 @@ export function clipsUpTo(clips, tMs) {
   if (!Array.isArray(clips)) return [];
   return clips.filter((c) => c.t <= tMs).sort((a, b) => b.t - a.t);
 }
+
+// The whole session's clips for a driver, most-recent first, each flagged with
+// `upcoming` = its time is after the current replay cursor T. We show the full
+// list (not just ≤ T) because radio is sparse — gating the list to ≤ T made it
+// read "no team radio" for almost every driver/cursor. Upcoming clips are still
+// playable (this is a replay of a completed race).
+export function clipsForList(clips, tMs) {
+  if (!Array.isArray(clips)) return [];
+  return clips
+    .map((c) => ({ ...c, upcoming: c.t > tMs }))
+    .sort((a, b) => b.t - a.t);
+}
+
+// Which clip to auto-play when a driver is focused: prefer the most recent clip
+// at/or before T (contextual to the cursor); if none has happened yet, fall back
+// to the earliest clip so focusing a driver who has radio always plays something.
+export function clipToAutoplay(clips, tMs) {
+  const before = latestClipAtOrBefore(clips, tMs);
+  if (before) return before;
+  return (Array.isArray(clips) && clips.length) ? clips[0] : null;
+}

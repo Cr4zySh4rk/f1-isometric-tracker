@@ -722,8 +722,11 @@ html, body {
 }
 .dp-clip:hover { border-color: var(--red); }
 .dp-clip.playing { background: rgba(55,214,122,0.18); border-color: #37d67a; color: #b6f5cf; }
+.dp-clip.upcoming { opacity: 0.55; }
+.dp-clip-up { font-size: 9px; color: var(--text-dim); }
 .dp-clip-dot { font-size: 10px; }
 .dp-clip-empty { color: var(--text-dim); font-size: 11px; font-style: italic; }
+.dp-radio-err { color: var(--red-bright); font-size: 11px; margin: 2px 0 4px; }
 
 /* ---------- Right-hand stack: weather + standings ---------- */
 .right-stack {

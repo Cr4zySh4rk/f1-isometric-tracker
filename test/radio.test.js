@@ -3,7 +3,7 @@
 // first. Verified against real OpenF1 /team_radio shapes.
 import { describe, it, expect } from 'vitest';
 import {
-  normalizeClips, latestClipAtOrBefore, clipsUpTo,
+  normalizeClips, latestClipAtOrBefore, clipsUpTo, clipsForList, clipToAutoplay,
 } from '../src/data/radio.js';
 
 const RAW = [
@@ -49,5 +49,36 @@ describe('clipsUpTo', () => {
   });
   it('is empty before the first clip', () => {
     expect(clipsUpTo(c, Date.parse('2026-07-05T13:00:00+00:00'))).toEqual([]);
+  });
+});
+
+describe('clipsForList (whole session, flags upcoming)', () => {
+  const c = normalizeClips(RAW, 1);
+  it('lists ALL of the driver clips most-recent first regardless of T', () => {
+    const t = Date.parse('2026-07-05T14:15:00+00:00'); // before b and c
+    const list = clipsForList(c, t);
+    expect(list.map((x) => x.url)).toEqual(['https://x/NOR_c.mp3', 'https://x/NOR_b.mp3', 'https://x/NOR_a.mp3']);
+  });
+  it('flags clips after T as upcoming', () => {
+    const t = Date.parse('2026-07-05T14:25:00+00:00'); // after a, before b & c
+    const byUrl = Object.fromEntries(clipsForList(c, t).map((x) => [x.url, x.upcoming]));
+    expect(byUrl['https://x/NOR_a.mp3']).toBe(false);
+    expect(byUrl['https://x/NOR_b.mp3']).toBe(true);
+    expect(byUrl['https://x/NOR_c.mp3']).toBe(true);
+  });
+});
+
+describe('clipToAutoplay (focus autoplay pick)', () => {
+  const c = normalizeClips(RAW, 1);
+  it('prefers the most recent clip ≤ T', () => {
+    const t = Date.parse('2026-07-05T15:10:00+00:00');
+    expect(clipToAutoplay(c, t).url).toBe('https://x/NOR_b.mp3');
+  });
+  it('falls back to the earliest clip when none has happened yet', () => {
+    const t = Date.parse('2026-07-05T13:00:00+00:00');
+    expect(clipToAutoplay(c, t).url).toBe('https://x/NOR_a.mp3');
+  });
+  it('returns null when the driver has no clips', () => {
+    expect(clipToAutoplay([], 0)).toBeNull();
   });
 });

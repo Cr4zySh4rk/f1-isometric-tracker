@@ -89,7 +89,8 @@ export async function buildTrack(store, source) {
   const { group: ribbonGroup, sectors } = buildSectorRibbon(pts, normals, TRACK_WIDTH, sectorRanges, disposables);
   group.add(ribbonGroup);
   group.add(buildKerbs(pts, normals, TRACK_WIDTH, disposables));
-  group.add(buildWalls(pts, normals, TRACK_WIDTH, disposables));
+  // Outer walls removed — the gray border read as a collision box and looked
+  // cluttered in the isometric view. The kerb-edged ribbon defines the track.
   const sf = buildStartFinish(pts, normals, TRACK_WIDTH, meta.startIndex || 0, disposables);
   group.add(sf.group);
 
@@ -318,6 +319,8 @@ function buildKerbs(pts, normals, width, disposables) {
   return group;
 }
 
+// Kept for reference but no longer added to the scene (outer walls removed).
+// eslint-disable-next-line no-unused-vars
 function buildWalls(pts, normals, width, disposables) {
   const n = pts.length;
   const half = width / 2 + 2.5;

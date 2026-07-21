@@ -109,6 +109,16 @@ html, body {
 .lap-counter .lap-word { color: var(--text-dim); font-size: 13px; letter-spacing: 2px; }
 .lap-counter .lap-total { color: var(--text-dim); }
 
+/* Formation lap — clearly distinct from a numbered racing lap */
+.lap-counter .lap-formation,
+.tw-formation {
+  color: #ffcf3f;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  animation: formationPulse 1.6s ease-in-out infinite;
+}
+@keyframes formationPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+
 /* ---------- Flag banner ---------- */
 .flag-banner {
   pointer-events: auto;

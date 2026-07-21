@@ -95,12 +95,15 @@ export class Hud {
   _renderClock(tMs) {
     if (this.store.isRace()) {
       const { lap, total, phase } = lapAtTime(this.store.laps, tMs);
-      if (total > 0) {
-        const n = phase === 'pre' ? 1 : lap;
+      if (phase === 'pre') {
+        // Before racing lap 1 starts, the field is on the formation lap /
+        // grid — not "LAP 1". Call it out clearly.
+        this.elHeadLap.innerHTML = `<span class="tw-formation">FORMATION LAP</span>`;
+      } else if (total > 0) {
         const showTotal = total > 0 && !this.clock.live;
         this.elHeadLap.innerHTML = showTotal
-          ? `LAP <b>${n}</b><span class="tw-lap-total">/${total}</span>`
-          : `LAP <b>${n}</b>`;
+          ? `LAP <b>${lap}</b><span class="tw-lap-total">/${total}</span>`
+          : `LAP <b>${lap}</b>`;
       } else {
         this.elHeadLap.textContent = '';
       }
@@ -113,9 +116,12 @@ export class Hud {
   }
 
   _renderLap(tMs) {
-    const { current, total } = this.store.currentLapAt(tMs);
-    if (total > 0) {
-      this.elLap.innerHTML = `<span class="lap-word">LAP</span> <b>${current}</b><span class="lap-total">/${total}</span>`;
+    const { lap, total, phase } = lapAtTime(this.store.laps, tMs);
+    if (phase === 'pre') {
+      this.elLap.innerHTML = `<span class="lap-word lap-formation">FORMATION LAP</span>`;
+      this.elLap.classList.remove('hidden');
+    } else if (total > 0) {
+      this.elLap.innerHTML = `<span class="lap-word">LAP</span> <b>${lap}</b><span class="lap-total">/${total}</span>`;
       this.elLap.classList.remove('hidden');
     } else {
       this.elLap.classList.add('hidden');

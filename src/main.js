@@ -149,8 +149,8 @@ async function boot() {
     onPick: (session, meta) => loadSession(session, meta),
     onError: (e) => {
       if (e instanceof LiveBlockError || (e && e.isLiveBlock)) {
-        showBanner('Live F1 session in progress — free OpenF1 access is paused until ~30 min after the session. Retrying automatically…', 'warn', 'Retry now', () => picker.open(true));
-        scheduleLiveRetry(() => picker.open(true));
+        showBanner('Live F1 session in progress — free OpenF1 access is paused until ~30 min after the session. Retrying automatically…', 'warn', 'Retry now', () => picker.open(false));
+        scheduleLiveRetry(() => picker.open(false));
       }
     },
   });
@@ -158,10 +158,8 @@ async function boot() {
   // Expose a way to reopen the picker.
   document.getElementById('session-title').addEventListener('click', () => picker.open(false));
 
-  showLoading('Finding the latest race…');
-  await picker.open(true);
-  // If auto-select found a race, loadSession runs; otherwise picker stays open.
-  hideLoading();
+  // Open the picker and let the user choose — nothing auto-loads on startup.
+  await picker.open(false);
 
   startLoop();
 }

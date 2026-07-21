@@ -84,7 +84,16 @@ async function setup() {
   }
   r.frameTrack(centerline);
 
-  const store = { teamColour: () => '#3671c6', acronym: () => 'VER', laps: [] };
+  // The real SessionStore exposes `driversByNumber` (a Map of the session's
+  // registered drivers). CarManager now consults it (data/entrants.js) to tell
+  // real drivers — which get a raycast hit-proxy and are pickable/followable —
+  // apart from the FIA safety/medical cars, which do not. The follow probe drives
+  // numbers 1 and 44, so both must be registered as real drivers, exactly as the
+  // real store would after loading /drivers.
+  const store = {
+    teamColour: () => '#3671c6', acronym: () => 'VER', laps: [],
+    driversByNumber: new Map([[1, { driver_number: 1 }], [44, { driver_number: 44 }]]),
+  };
   const transform = { toScene: (x, y) => ({ x: x / 10, z: y / 10 }) };
   const carMgr = new CarManager(r, store, transform);
   return { THREE, canvas, r, carMgr };

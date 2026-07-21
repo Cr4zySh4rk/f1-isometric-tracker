@@ -6,7 +6,7 @@
 // All timing decisions live in ../data/timing.js and ../data/raceControl.js
 // (pure, unit-tested); this module only renders the model to the DOM.
 
-import { buildTowerRows } from '../data/timing.js';
+import { buildTowerRows, lapAtTime } from '../data/timing.js';
 import { fmtSessionClock } from '../util/format.js';
 
 export function sessionLabel(session) {
@@ -47,12 +47,14 @@ export class Hud {
       <div class="tw-header">
         <span class="tw-mark">F1</span>
         <span class="tw-session" id="tw-session">${sessionLabel(this.store.session)}</span>
+        <span class="tw-hlap" id="tw-hlap"></span>
         <span class="tw-clock" id="tw-clock">--:--</span>
       </div>
       <div class="tw-status tw-status-green" id="tw-status">TRACK CLEAR</div>
       <div class="tw-rows" id="tw-rows"></div>`;
     this.elRows = this.elTower.querySelector('#tw-rows');
     this.elClock = this.elTower.querySelector('#tw-clock');
+    this.elHeadLap = this.elTower.querySelector('#tw-hlap');
     this.elStatus = this.elTower.querySelector('#tw-status');
 
     // Event delegation: row press selects driver; status/delta header toggles.
@@ -86,7 +88,26 @@ export class Hud {
     this._renderRows(tMs);
   }
 
+  // Tower header: races show the LEADER's current lap ("LAP n / total"); in
+  // live mode the total is not yet knowable, so just "LAP n". Practice/quali
+  // show the session time remaining instead. Replay-time-aware (recomputed at
+  // T as the cursor moves/seeks).
   _renderClock(tMs) {
+    if (this.store.isRace()) {
+      const { lap, total, phase } = lapAtTime(this.store.laps, tMs);
+      if (total > 0) {
+        const n = phase === 'pre' ? 1 : lap;
+        const showTotal = total > 0 && !this.clock.live;
+        this.elHeadLap.innerHTML = showTotal
+          ? `LAP <b>${n}</b><span class="tw-lap-total">/${total}</span>`
+          : `LAP <b>${n}</b>`;
+      } else {
+        this.elHeadLap.textContent = '';
+      }
+      this.elClock.classList.add('tw-clock-race');
+    } else {
+      this.elHeadLap.textContent = '';
+    }
     const remaining = Math.max(0, this.clock.end - tMs);
     this.elClock.textContent = fmtSessionClock(remaining);
   }

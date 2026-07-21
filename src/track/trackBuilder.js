@@ -14,24 +14,38 @@
 import * as THREE from 'three';
 import { OpenF1Provider } from '../data/providers/openf1Provider.js';
 import {
-  resampleByArcLength, smoothClosed, fitTransform, computeNormals,
+  resampleByArcLength, fitTransform, computeNormals,
   curvature, arcLengths, syntheticOval,
+  medianCenterline, resampleAdaptive, smoothAdaptive,
 } from './trackMath.js';
 import { splitSectorsByLength, SECTOR_COLORS } from '../data/sectors.js';
 
 const SCENE_SIZE = 200; // target max horizontal extent of the track in scene units
 const TRACK_WIDTH = 12; // scene units (~ real metres after scaling, roughly)
-const RESAMPLE_POINTS = 600;
-const LS_KEY = (k) => `f1iso.track.${k}`;
+const RESAMPLE_POINTS = 700;
+const WORKING_POINTS = 900; // dense uniform resolution before the adaptive pass
+const MEDIAN_LAPS = 5; // aggregate up to this many clean fast laps
+// v2: median-of-laps centerline + adaptive resampling (key bump invalidates the
+// oversmoothed v1 shapes users may have cached).
+const TRACK_CACHE_VERSION = 2;
+const LS_KEY = (k) => `f1iso.track.v${TRACK_CACHE_VERSION}.${k}`;
 
 // Public: coordinate transform from OpenF1 world (x,y) to scene (x,z).
+//
+// ORIENTATION: scene z is the NEGATED world y. Verified against real circuit
+// maps (Silverstone / Spielberg / Spa, all driven clockwise): the raw traces
+// run clockwise when plotted y-UP, so mapping world +y to scene +z (which the
+// top-down camera shows pointing down-screen) rendered every circuit MIRRORED.
+// The flip lives here — the one transform shared by track, cars and camera —
+// so all consumers stay in a single consistent frame (evidence:
+// test/evidence/*_orient.png, scripts/trackDump.mjs).
 export function makeTransform(centerRaw, scale) {
   return {
     cx: centerRaw.x,
     cy: centerRaw.y,
     scale,
     toScene(wx, wy) {
-      return { x: (wx - centerRaw.x) * scale, z: (wy - centerRaw.y) * scale };
+      return { x: (wx - centerRaw.x) * scale, z: -(wy - centerRaw.y) * scale };
     },
   };
 }
@@ -95,40 +109,100 @@ export async function buildTrack(store, source) {
 
 // --- centerline derivation from location data ------------------------------
 
-async function deriveCenterlineFromData(store, source) {
-  const lap = store.fastestLap();
-  if (!lap) {
-    return { centerline: syntheticOval(), meta: { synthetic: true, startIndex: 0 } };
+// Pick up to `count` clean fast laps for the centerline: plausible flying laps
+// (no pit-out, sane duration, within 107% of the session's fastest), preferring
+// distinct drivers so per-car GPS bias doesn't survive the median.
+export function selectCenterlineLaps(laps, count = MEDIAN_LAPS) {
+  const clean = (Array.isArray(laps) ? laps : [])
+    .filter((l) => l && l.date_start && typeof l.lap_duration === 'number')
+    .filter((l) => l.lap_duration >= 40 && l.lap_duration <= 300 && !l.is_pit_out_lap)
+    .sort((a, b) => a.lap_duration - b.lap_duration);
+  if (!clean.length) return [];
+  const cutoff = clean[0].lap_duration * 1.07;
+  const eligible = clean.filter((l) => l.lap_duration <= cutoff);
+  const picked = [];
+  const drivers = new Set();
+  for (const l of eligible) { // distinct drivers first
+    if (picked.length >= count) break;
+    if (drivers.has(l.driver_number)) continue;
+    drivers.add(l.driver_number);
+    picked.push(l);
   }
+  for (const l of eligible) { // then fill with extra laps from the same drivers
+    if (picked.length >= count) break;
+    if (!picked.includes(l)) picked.push(l);
+  }
+  return picked;
+}
+
+// Fetch one lap's location trace, trimmed to exactly [date_start, +duration]
+// so every lap starts at the start/finish line (this aligns the laps for the
+// pointwise median). Returns [{x,y}] or [] on failure.
+async function fetchLapTrace(store, source, lap) {
   const driver = lap.driver_number;
   const t0 = Date.parse(lap.date_start);
   const dur = (lap.lap_duration || 100) * 1000;
   const startISO = new Date(t0 - 3000).toISOString();
   const endISO = new Date(t0 + dur + 3000).toISOString();
-
   let rows = [];
   try {
-    // null => provider has no telemetry (Approximate mode) => synthetic oval.
+    // null => provider has no telemetry (Approximate mode).
     rows = await source.getLocationWindow(store.session, startISO, endISO);
   } catch (e) {
     if (e && e.isLiveBlock) throw e;
     rows = [];
   }
-
-  const trace = (Array.isArray(rows) ? rows : [])
+  return (Array.isArray(rows) ? rows : [])
     .filter((r) => r && r.driver_number === driver && r.x != null && r.y != null)
     .filter((r) => !(r.x === 0 && r.y === 0))
     .map((r) => ({ t: Date.parse(r.date), x: r.x, y: r.y }))
-    .filter((r) => !isNaN(r.t))
+    .filter((r) => !isNaN(r.t) && r.t >= t0 && r.t <= t0 + dur)
     .sort((a, b) => a.t - b.t);
+}
 
-  if (trace.length < 20) {
+// v2 pipeline: 3–5 clean fast laps → per-lap arc-length resample → pointwise
+// MEDIAN centerline (kills GPS jitter without rounding corners) → adaptive
+// resample (dense where curvature is high) → light curvature-aware smoothing
+// (attenuated in corners so chicanes/hairpins keep their true shape).
+async function deriveCenterlineFromData(store, source) {
+  const laps = selectCenterlineLaps(store.laps);
+  if (!laps.length) {
     return { centerline: syntheticOval(), meta: { synthetic: true, startIndex: 0 } };
   }
 
-  const resampled = resampleByArcLength(trace, RESAMPLE_POINTS);
-  const smooth = smoothClosed(resampled, 2);
-  return { centerline: smooth, meta: { synthetic: false, startIndex: 0, driver } };
+  const traces = [];
+  for (const lap of laps) {
+    const t = await fetchLapTrace(store, source, lap);
+    if (t.length >= 100) traces.push(t);
+    if (!traces.length && lap !== laps[0]) break; // provider has no telemetry
+  }
+
+  if (!traces.length || traces[0].length < 20) {
+    return { centerline: syntheticOval(), meta: { synthetic: true, startIndex: 0 } };
+  }
+
+  const base = traces.length >= 2
+    ? medianCenterline(traces, WORKING_POINTS)
+    : resampleByArcLength(traces[0], WORKING_POINTS);
+  const adaptive = resampleAdaptive(base, RESAMPLE_POINTS, { tension: 3 });
+  // Single-lap fallback carries raw jitter → smooth a touch harder.
+  const smooth = smoothAdaptive(adaptive, {
+    lambda: traces.length >= 2 ? 0.35 : 0.5,
+    passes: 2,
+    cornerKeep: 0.85,
+  });
+  return {
+    centerline: smooth,
+    meta: {
+      synthetic: false,
+      startIndex: 0,
+      driver: laps[0].driver_number,
+      lapsUsed: laps.slice(0, traces.length).map((l) => ({
+        driver_number: l.driver_number, lap_number: l.lap_number,
+      })),
+      version: TRACK_CACHE_VERSION,
+    },
+  };
 }
 
 // --- geometry builders (scene space) ---------------------------------------

@@ -42,10 +42,16 @@ src/
   api/openf1.js        throttled queue (3/s, 30/min), retry, live-block detection, cache
   data/sessionStore.js session metadata, drivers, laps, positions, race control
   data/replayBuffer.js chunked location/interval prefetcher + time-indexed lookup
+                        (window size + interval stride scale with playback speed)
+  data/windowPlan.js   pure speed→window-size math keeping prefetch ≤ 30 req/min
+  data/entrants.js     classify telemetry numbers not in /drivers as SC/MED cars
   engine/clock.js      playback clock: play/pause, 0.5–30× speed, seek, live mode
+  engine/bufferGate.js hold/release "Buffering…" state machine (cars never vanish)
   engine/interp.js     per-driver position interpolation (Catmull-Rom over samples)
-  track/trackBuilder.js derive centerline from a clean flying lap → smooth →
-                        ribbon mesh (track), kerbs, start/finish line, walls
+  track/trackMath.js   pure geometry: median-of-laps centerline, adaptive resample,
+                        curvature-aware smoothing, normals, arc length
+  track/trackBuilder.js derive centerline from several clean fast laps → median →
+                        adaptive resample → smooth → ribbon mesh, kerbs, S/F, walls
   scene/renderer.js    three.js scene, OrthographicCamera in isometric attitude
                        (rotated 45° yaw, ~35.26° pitch), soft shadows, sky gradient
   scene/cars.js        3D car model per driver, tinted with team_colour,
@@ -67,6 +73,31 @@ Primary: low-poly formula-style glTF model (CC0, Kenney racing assets), cloned 2
 body material tinted per `team_colour`. Fallback: procedural low-poly F1 built from
 three.js primitives (body, nose, wings, 4 wheels, halo) — guaranteed to work offline.
 Cars orient along velocity vector; wheels spin with speed.
+
+### Recent upgrades (T1–T4)
+- **T1 — cars never vanish on seek / at high speed.** `data/windowPlan.js` scales
+  the prefetch window duration and interval-feed stride with playback speed so one
+  fetch always covers ≥ 15 s of wall-clock playback; `requestBudgetPerMin(30) ≈ 6`,
+  well under the OpenF1 30 req/min limit (at 1× the classic 90 s window is kept).
+  `engine/bufferGate.js` is a hold/release state machine wired into the main loop:
+  when the cursor sits on an unbuffered window it HOLDS the clock (with a
+  "Buffering…" chip) and releases the instant data arrives — so playback is never
+  running blindly over unfetched data. `main.js` passes `clock.speed` to
+  `buffer.update()` and drives the gate every frame.
+- **T2 — track fidelity.** `track/trackMath.js` builds the centerline from the
+  pointwise MEDIAN of several clean fast laps (kills GPS jitter without rounding
+  corners), then resamples adaptively (dense in corners) and smooths with a
+  curvature-attenuated Laplacian. The localStorage cache key is bumped to `v2` so
+  users get the new shapes. Derived lap lengths match official circuit lengths to
+  ~1 % (Silverstone/Spielberg/Spa; OpenF1 /location units are decimetres).
+- **T3 — lap counter.** `data/timing.js#lapAtTime` (pure, replay-time-aware) gives
+  "LAP n / total" as the leader's lap; rendered in the tower header by `ui/hud.js`.
+- **T4 — safety / medical cars.** Telemetry numbers absent from `/drivers`
+  (241/242 = SC, 243 = MED, verified against real deployments) are classified by
+  `data/entrants.js` and drawn by `scene/cars.js` as a distinct closed-cockpit
+  road car with an amber light bar and an SC/MED label — with no raycast hit-proxy,
+  so they are not pickable/followable, and they are excluded from the timing tower,
+  fastest-lap and sector logic.
 
 ### Playback vs live
 One code path: the replay engine always renders "session time T". In replay, T is

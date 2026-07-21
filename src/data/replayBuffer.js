@@ -1,9 +1,17 @@
 // Chunked streaming replay buffer.
 //
-// The session is divided into fixed windows of WINDOW_MS of *session time*.
-// For the window containing the playback cursor and PREFETCH_AHEAD windows in
-// front, we fetch /location (and /intervals for races) for ALL drivers in one
-// request each. Windows far behind the cursor are evicted to cap memory.
+// The session is divided into windows of `windowMs` of *session time*. For the
+// window containing the playback cursor and PREFETCH_AHEAD windows in front, we
+// fetch /location (and /intervals for races) for ALL drivers in one request
+// each. Windows far behind the cursor are evicted to cap memory.
+//
+// SPEED-AWARE WINDOW SIZING (see data/windowPlan.js): at high playback speeds a
+// fixed 90 s window cannot be prefetched inside the 30 req/min budget, so the
+// window duration scales with speed (one fetch covers ≥ 15 s of wall-clock)
+// and the intervals feed is subsampled (every Nth window). Because the window
+// grid can therefore change at runtime, fetched session-time COVERAGE is
+// tracked as merged [start,end] ranges independent of the grid — a re-grid
+// keeps everything already fetched and never refetches covered spans.
 //
 // Location rows feed per-driver DriverTrack instances (engine/interp.js), which
 // own the interpolation. Intervals are stored as time-sorted arrays per driver.
@@ -11,8 +19,9 @@
 import { LiveBlockError } from '../api/openf1.js';
 import { OpenF1Provider } from './providers/openf1Provider.js';
 import { DriverTrack } from '../engine/interp.js';
+import { BASE_WINDOW_MS, windowMsForSpeed, intervalStrideForSpeed } from './windowPlan.js';
 
-const WINDOW_MS = 90000; // 90 s windows
+const WINDOW_MS = BASE_WINDOW_MS; // re-exported for back-compat
 const PREFETCH_AHEAD = 3; // keep 3 windows ahead of the cursor
 const KEEP_BEHIND = 1; // keep 1 window behind before eviction
 
@@ -30,6 +39,11 @@ export class ReplayBuffer {
     if (isNaN(this.startMs)) this.startMs = Date.now() - 3600000;
     if (isNaN(this.endMs)) this.endMs = this.startMs + 3600000;
 
+    this.windowMs = BASE_WINDOW_MS; // current grid pitch (scales with speed)
+    this._ivStride = 1; // fetch intervals every Nth window
+    this._gridGen = 0; // bumped on re-grid; stale fetches re-sync via coverage
+    this.coverage = []; // merged, sorted [startMs, endMs] fetched ranges
+
     this.tracks = new Map(); // driver_number -> DriverTrack
     this.intervals = new Map(); // driver_number -> [{t, gap, interval}]
     this.windows = new Map(); // windowIndex -> 'pending' | 'loaded' | 'error' | 'liveblock'
@@ -45,29 +59,46 @@ export class ReplayBuffer {
   }
 
   windowIndex(tMs) {
-    return Math.floor((tMs - this.startMs) / WINDOW_MS);
+    return Math.floor((tMs - this.startMs) / this.windowMs);
   }
   windowRange(idx) {
-    const a = this.startMs + idx * WINDOW_MS;
+    const a = this.startMs + idx * this.windowMs;
     // Small overlap so interpolation across window seams has neighbor samples.
-    return { start: a - 500, end: a + WINDOW_MS + 500 };
+    return { start: a - 500, end: a + this.windowMs + 500 };
   }
   totalWindows() {
-    return Math.max(1, Math.ceil((this.endMs - this.startMs) / WINDOW_MS));
+    return Math.max(1, Math.ceil((this.endMs - this.startMs) / this.windowMs));
+  }
+
+  // Rescale the window grid for the current playback speed. Cheap when nothing
+  // changes. On change, already-fetched coverage is kept and mapped onto the
+  // new grid (fully covered windows are marked 'loaded' so they never refetch).
+  setSpeed(speed) {
+    this._ivStride = intervalStrideForSpeed(speed);
+    const target = windowMsForSpeed(speed);
+    if (target === this.windowMs) return;
+    this.windowMs = target;
+    this._gridGen++;
+    // Rebuild the grid: fetched coverage is kept; anything not fully covered is
+    // refetched by update(). (A live-blocked window simply re-detects the block
+    // on its next fetch and re-fires onLiveBlock — no state is lost.)
+    this.windows = new Map();
+    this._markCoveredWindows();
   }
 
   // Which windows are currently loaded (for the transport buffered indicator).
   loadedFractions() {
-    const total = this.totalWindows();
-    const ranges = [];
-    for (const [idx, st] of this.windows) {
-      if (st === 'loaded') ranges.push([idx / total, (idx + 1) / total]);
-    }
-    return ranges;
+    const span = this.endMs - this.startMs || 1;
+    return this.coverage.map(([a, b]) => [
+      Math.max(0, (a - this.startMs) / span),
+      Math.min(1, (b - this.startMs) / span),
+    ]);
   }
 
   // Ensure windows around the cursor are fetched. Call every frame (cheap).
-  update(tMs) {
+  // `speed` (optional) is the playback speed — drives the window-sizing math.
+  update(tMs, speed) {
+    if (speed != null) this.setSpeed(speed);
     const cur = this.windowIndex(tMs);
     const last = this.totalWindows() - 1;
     for (let i = cur; i <= Math.min(last, cur + PREFETCH_AHEAD); i++) {
@@ -83,12 +114,17 @@ export class ReplayBuffer {
   _evict(cur) {
     const cutoff = cur - KEEP_BEHIND;
     if (cutoff <= 0) return;
-    const cutoffMs = this.startMs + cutoff * WINDOW_MS;
+    const cutoffMs = this.startMs + cutoff * this.windowMs;
     for (const [idx, st] of [...this.windows]) {
       if (idx < cutoff && st === 'loaded') {
         this.windows.delete(idx); // allow refetch if we seek back
       }
     }
+    // Trim coverage behind the cutoff — those samples are being evicted, so a
+    // seek back must refetch them.
+    this.coverage = this.coverage
+      .map(([a, b]) => [Math.max(a, cutoffMs), b])
+      .filter(([a, b]) => b - a > 1000);
     for (const t of this.tracks.values()) t.evictBefore(cutoffMs);
     for (const [num, arr] of this.intervals) {
       let i = 0;
@@ -97,14 +133,56 @@ export class ReplayBuffer {
     }
   }
 
+  // --- coverage bookkeeping (grid-independent fetched ranges) ---------------
+
+  _addCoverage(a, b) {
+    const ranges = [...this.coverage, [a, b]].sort((r, s) => r[0] - s[0]);
+    const merged = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (last && r[0] <= last[1] + 1) last[1] = Math.max(last[1], r[1]);
+      else merged.push([r[0], r[1]]);
+    }
+    this.coverage = merged;
+  }
+
+  coversPoint(tMs) {
+    for (const [a, b] of this.coverage) if (tMs >= a && tMs <= b) return true;
+    return false;
+  }
+
+  _coversRange(a, b) {
+    for (const [x, y] of this.coverage) if (a >= x && b <= y) return true;
+    return false;
+  }
+
+  // Mark current-grid windows fully inside fetched coverage as 'loaded'.
+  _markCoveredWindows() {
+    for (const [a, b] of this.coverage) {
+      const i0 = Math.max(0, Math.ceil((a - this.startMs) / this.windowMs));
+      const i1 = Math.floor((b - this.startMs) / this.windowMs) - 1;
+      for (let i = i0; i <= i1; i++) {
+        const ws = this.startMs + i * this.windowMs;
+        const we = ws + this.windowMs;
+        if (ws >= a && we <= b && this.windows.get(i) === undefined) {
+          this.windows.set(i, 'loaded');
+        }
+      }
+    }
+  }
+
   async _fetchWindow(idx) {
     if (this._inflight.has(idx)) return;
     this._inflight.add(idx);
+    const gen = this._gridGen;
     this.windows.set(idx, 'pending');
     const { start, end } = this.windowRange(idx);
     const sISO = new Date(start).toISOString();
     const eISO = new Date(end).toISOString();
     const sess = this.store.session;
+    // Intervals subsampling: at high speed fetch intervals only every Nth
+    // window (windowPlan.intervalStrideForSpeed) — they're 4 s cadence data.
+    const wantIntervals = this.isRace && idx % this._ivStride === 0;
     try {
       // Location and intervals are fetched INDEPENDENTLY. Intervals legitimately
       // return 404 "No results found" in the first ~90 s of a race (no gaps
@@ -114,13 +192,15 @@ export class ReplayBuffer {
       // invisible at the default start-of-race cursor).
       const [locRes, ivRes] = await Promise.allSettled([
         this.source.getLocationWindow(sess, sISO, eISO),
-        this.isRace ? this.source.getIntervals(sess, sISO, eISO) : Promise.resolve(null),
+        wantIntervals ? this.source.getIntervals(sess, sISO, eISO) : Promise.resolve(null),
       ]);
+
+      const sameGrid = gen === this._gridGen;
 
       // A live-block on either feed pauses the whole session (free-tier window).
       const lb = liveBlockOf(locRes) || liveBlockOf(ivRes);
       if (lb) {
-        this.windows.set(idx, 'liveblock');
+        if (sameGrid) this.windows.set(idx, 'liveblock');
         if (this.onLiveBlock) this.onLiveBlock(lb);
         return;
       }
@@ -132,7 +212,7 @@ export class ReplayBuffer {
       // hammering the rate-limited queue re-requesting it forever.
       if (locRes.status === 'rejected') {
         if (!isNoResults(locRes.reason)) {
-          this.windows.set(idx, 'error');
+          if (sameGrid) this.windows.set(idx, 'error');
           return;
         }
       } else {
@@ -142,14 +222,18 @@ export class ReplayBuffer {
       // Intervals are optional: ingest when present, ignore any failure.
       if (ivRes.status === 'fulfilled' && ivRes.value) this._ingestIntervals(ivRes.value);
 
-      this.windows.set(idx, 'loaded');
+      // Record fetched session-time coverage (the pure window span, without the
+      // ±500 ms seam overlap, so adjacent windows merge exactly).
+      this._addCoverage(start + 500, end - 500);
+      if (sameGrid) this.windows.set(idx, 'loaded');
+      else this._markCoveredWindows(); // re-gridded mid-flight: sync new grid
       if (this.onProgress) this.onProgress();
     } catch (err) {
       // Defensive: an unexpected throw outside allSettled.
       if (err instanceof LiveBlockError || (err && err.isLiveBlock)) {
-        this.windows.set(idx, 'liveblock');
+        if (gen === this._gridGen) this.windows.set(idx, 'liveblock');
         if (this.onLiveBlock) this.onLiveBlock(err);
-      } else {
+      } else if (gen === this._gridGen) {
         this.windows.set(idx, 'error');
       }
     } finally {
@@ -200,9 +284,10 @@ export class ReplayBuffer {
     return ans >= 0 ? arr[ans] : null;
   }
 
-  // Is the window at cursor loaded yet? (for a "buffering" spinner)
+  // Is the cursor sitting on fetched data? (drives the buffering hold/chip)
   isCursorBuffered(tMs) {
-    return this.windows.get(this.windowIndex(tMs)) === 'loaded';
+    if (this.windows.get(this.windowIndex(tMs)) === 'loaded') return true;
+    return this.coversPoint(tMs);
   }
 
   // Sample every driver at time T. Returns Map(driver_number -> state).

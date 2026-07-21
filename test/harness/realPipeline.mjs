@@ -70,6 +70,17 @@ const { buildTrack } = await import('../../src/track/trackBuilder.js');
 const { ProviderManager } = await import('../../src/data/providers/manager.js');
 const { OpenF1Provider } = await import('../../src/data/providers/openf1Provider.js');
 const { JolpicaProvider } = await import('../../src/data/providers/jolpicaProvider.js');
+// Upgrade modules under test (T1 window budget, T3 lap counter, T4 safety car).
+const { requestBudgetPerMin } = await import('../../src/data/windowPlan.js');
+const { lapAtTime, buildTowerRows } = await import('../../src/data/timing.js');
+const { classifyEntrant } = await import('../../src/data/entrants.js');
+
+// OpenF1 /location x,y are DECIMETRES (1 unit ≈ 0.1 m): a derived lap arc length
+// divided by 10 matches the official circuit length to ~1 %. Official lengths
+// (m) keyed by circuit_short_name.
+const OF1_UNIT_M = 0.1;
+const OFFICIAL_LEN_M = { Silverstone: 5891, Spielberg: 4318, 'Spa-Francorchamps': 7004 };
+const LEN_TOL = 0.05; // derived length must be within 5 % of official
 
 const providers = new ProviderManager({
   primary: new OpenF1Provider(),
@@ -77,6 +88,86 @@ const providers = new ProviderManager({
 });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// T2 fidelity: derived circuit length (m) vs official, from the scene-space
+// perimeter divided back through the transform scale into raw (decimetre) units.
+function trackLengthCheck(track, circuitShortName) {
+  const official = OFFICIAL_LEN_M[circuitShortName];
+  const derivedM = (track.meta.totalLen / track.meta.scale) * OF1_UNIT_M;
+  if (official == null) return { ok: true, derivedM, official: null, err: null };
+  const err = (derivedM - official) / official;
+  return { ok: Math.abs(err) <= LEN_TOL, derivedM, official, err };
+}
+
+// T3 lap counter: lapAtTime must be monotonic non-decreasing and in [1,total]
+// across the sampled offsets (with real /laps for the session).
+function lapCounterCheck(store, startMs, offsets) {
+  const samples = [];
+  let prev = 0, ok = true, total = 0;
+  for (const off of offsets) {
+    const r = lapAtTime(store.laps, startMs + off);
+    total = r.total;
+    if (r.total <= 0) ok = false;
+    if (r.lap < prev || r.lap < 1 || r.lap > r.total) ok = false;
+    prev = r.lap;
+    samples.push(`T+${off / 1000}s=lap ${r.lap}/${r.total}(${r.phase})`);
+  }
+  return { ok: ok && total > 0, total, samples };
+}
+
+// T1 no-vanish at 30×: from a buffered cursor, drive playback at 30× exactly like
+// main.js — advance the cursor only when its window is buffered (otherwise the
+// BufferGate HOLDS and we fetch/retry without advancing). Assert that on every
+// buffered frame the real drivers are present (never vanish) and that the
+// prefetch request budget at 30× fits the 30 req/min OpenF1 limit.
+async function noVanishAt30x(buffer, store, fromMs) {
+  const SPEED = 30;
+  const budget = requestBudgetPerMin(SPEED);
+  buffer.update(fromMs, SPEED); // switch the prefetcher onto the 30× window grid
+  let t = fromMs, advanced = 0, held = 0, minCars = Infinity;
+  for (let step = 0; step < 12; step++) {
+    buffer.update(t, SPEED);
+    if (!buffer.isCursorBuffered(t)) {
+      const st = await awaitWindows(buffer, t); // gate holds; keep fetching
+      held++;
+      if (st === 'timeout') break;
+      continue;
+    }
+    let cars = 0;
+    for (const [num] of buffer.sampleAll(t)) if (store.driversByNumber.has(num)) cars++;
+    minCars = Math.min(minCars, cars);
+    advanced++;
+    t += SPEED * 1000; // 30 s of session per simulated wall-second at 30×
+  }
+  const ok = budget <= 30 && advanced > 0 && minCars >= 10;
+  return { ok, budget, advanced, held, minCars: minCars === Infinity ? null : minCars };
+}
+
+// T4 safety car: during a real SC deployment window, /location carries a
+// telemetry number absent from /drivers (the FIA safety/medical car). Assert it
+// is present, classified SC/MED, and EXCLUDED from the timing tower.
+async function safetyCarCheck(store, buffer, deployDateISO) {
+  const t0 = Date.parse(deployDateISO) + 60000; // 1 min into the deployment
+  await awaitWindows(buffer, t0);
+  await awaitWindows(buffer, t0 + 5000);
+  const scNums = [];
+  for (const [num] of buffer.sampleAll(t0)) {
+    if (!store.driversByNumber.has(num)) {
+      const k = classifyEntrant(num, store.driversByNumber);
+      scNums.push({ num, type: k.type, label: k.label });
+    }
+  }
+  const driverNums = store.drivers.map((d) => d.driver_number);
+  const rows = buildTowerRows({
+    isRace: true, driverNums, laps: store.laps, positions: store.positions, tMs: t0,
+    intervalFn: () => null,
+  });
+  const towerNums = new Set(rows.map((r) => r.num));
+  const scInTower = scNums.filter((s) => towerNums.has(s.num));
+  const ok = scNums.length >= 1 && scInTower.length === 0
+    && scNums.every((s) => s.type === 'safety' || s.type === 'medical');
+  return { ok, scNums, scInTower, towerSize: towerNums.size };
+}
 
 // The OpenF1 client self-throttles to 30 req/min; a patient full run must be able
 // to wait out that window, so the timeout is generous. Set HARNESS_FAST=1 for a
@@ -141,7 +232,7 @@ function followCameraCheck(track, buffer, fromMs, bb) {
   return { ok, num, dist, inFrame };
 }
 
-async function runSession(label, session) {
+async function runSession(label, session, opts = {}) {
   console.log(`\n=== ${label} : session_key=${session.session_key} (${session.circuit_short_name}) ===`);
   const store = new SessionStore(session, providers);
   await store.load();
@@ -152,6 +243,11 @@ async function runSession(label, session) {
   const bb = bboxOf(track.centerline);
   const spanX = bb.maxx - bb.minx, spanZ = bb.maxz - bb.minz;
   console.log(`track synthetic=${synthetic} bbox x[${bb.minx.toFixed(1)},${bb.maxx.toFixed(1)}] z[${bb.minz.toFixed(1)},${bb.maxz.toFixed(1)}] span=${spanX.toFixed(1)}x${spanZ.toFixed(1)} scale=${track.meta.scale?.toExponential(3)}`);
+
+  // T2: derived circuit length vs official (fidelity).
+  const len = trackLengthCheck(track, session.circuit_short_name);
+  console.log(`  T2 length: derived=${len.derivedM.toFixed(0)} m official=${len.official ?? 'n/a'} m` +
+    (len.official != null ? ` err=${(len.err * 100).toFixed(2)}% ok=${len.ok}` : ''));
 
   const buffer = new ReplayBuffer(store, providers);
   const { start } = store.timeWindow();
@@ -191,29 +287,81 @@ async function runSession(label, session) {
       (follow.num != null ? ` driver=${follow.num} lag=${follow.dist.toFixed(2)}u inFrame=${follow.inFrame}` : ` (${follow.why})`));
   }
 
-  return { synthetic, results, bb, follow };
+  // T3: lap counter monotonic/correct across the sampled offsets.
+  const lap = lapCounterCheck(store, startMs, OFFSETS);
+  console.log(`  T3 lap: ok=${lap.ok} total=${lap.total} [${lap.samples.join(', ')}]`);
+
+  // T1: no-vanish at 30× from the last (already-buffered) offset.
+  let novanish = { ok: true, skipped: true };
+  if (!synthetic) {
+    const T = startMs + OFFSETS[OFFSETS.length - 1];
+    await awaitWindows(buffer, T);
+    novanish = await noVanishAt30x(buffer, store, T);
+    console.log(`  T1 no-vanish@30×: ok=${novanish.ok} budget=${novanish.budget.toFixed(1)}/min` +
+      ` advancedFrames=${novanish.advanced} heldFrames=${novanish.held} minCarsWhenBuffered=${novanish.minCars}`);
+  }
+
+  // T4: safety car present in a real SC window and excluded from the tower.
+  let sc = { ok: true, skipped: true };
+  if (opts.scDate && !synthetic) {
+    sc = await safetyCarCheck(store, buffer, opts.scDate);
+    console.log(`  T4 safety-car: ok=${sc.ok} tower=${sc.towerSize} scEntities=${JSON.stringify(sc.scNums)}` +
+      ` inTower=${JSON.stringify(sc.scInTower)}`);
+  }
+
+  return { synthetic, results, bb, follow, len, lap, novanish, sc };
 }
 
 // Pick two real completed races from 2026 (a genuine session switch across
 // different circuits). Fetched live through the provider (disk-cached).
 const sess = await providers.getSessions({ year: 2026 });
 const byKey = (k) => sess.find((s) => s.session_key === k);
-const british = byKey(11326);   // Silverstone Race
+const british = byKey(11326);   // Silverstone Race (has a real SC deployment)
 const austria = byKey(11315);   // Spielberg Race
-if (!british || !austria) {
-  console.error('Could not resolve the 2026 Silverstone/Spielberg race sessions.');
+const belgium = byKey(11334);   // Spa Race (has a real SC deployment)
+if (!british || !austria || !belgium) {
+  console.error('Could not resolve the 2026 Silverstone/Spielberg/Spa race sessions.');
   process.exit(1);
+}
+
+// Lightweight third-circuit pass: derived-length fidelity + a second real SC
+// deployment (Spa), without the full replay-sampling / follow / 30× burst, to
+// cover T2/T4 across a third track while staying inside the request budget.
+async function runLenAndSC(label, session, scDate) {
+  console.log(`\n=== ${label} : session_key=${session.session_key} (${session.circuit_short_name}) ===`);
+  const store = new SessionStore(session, providers);
+  await store.load();
+  const track = await buildTrack(store, providers);
+  const synthetic = !!(track.meta && track.meta.synthetic);
+  const len = trackLengthCheck(track, session.circuit_short_name);
+  console.log(`  T2 length: derived=${len.derivedM.toFixed(0)} m official=${len.official ?? 'n/a'} m` +
+    (len.official != null ? ` err=${(len.err * 100).toFixed(2)}% ok=${len.ok}` : ''));
+  const buffer = new ReplayBuffer(store, providers);
+  const sc = await safetyCarCheck(store, buffer, scDate);
+  console.log(`  T4 safety-car: ok=${sc.ok} tower=${sc.towerSize} scEntities=${JSON.stringify(sc.scNums)}` +
+    ` inTower=${JSON.stringify(sc.scInTower)}`);
+  const pass = !synthetic && len.ok && sc.ok;
+  return pass ? 'PASS' : `FAIL(synthetic=${synthetic} len=${len.ok} t4=${sc.ok})`;
 }
 
 function verdict(r, { minWithin = 15 } = {}) {
   const cars = !r.synthetic && Object.values(r.results).some((x) => x.within >= minWithin && x.finite === x.present);
   const follow = !!(r.follow && r.follow.ok);
-  return cars && follow ? 'PASS' : `FAIL(cars=${cars} follow=${follow})`;
+  const len = !r.len || r.len.ok;
+  const lap = !r.lap || r.lap.ok;
+  const t1 = !r.novanish || r.novanish.ok;
+  const t4 = !r.sc || r.sc.ok;
+  const pass = cars && follow && len && lap && t1 && t4;
+  return pass ? 'PASS' : `FAIL(cars=${cars} follow=${follow} len=${len} lap=${lap} t1=${t1} t4=${t4})`;
 }
 
-const r1 = await runSession('British GP (Silverstone) Race', british);
+const r1 = await runSession('British GP (Silverstone) Race', british, {
+  scDate: '2026-07-05T15:18:50+00:00', // first SAFETY CAR DEPLOYED (verified)
+});
 const r2 = await runSession('Austria (Spielberg) Race — SWITCH', austria);
-const lines = [`British: ${verdict(r1)}`, `Austria(switch): ${verdict(r2)}`];
+// Third circuit (Spa) for T2 length fidelity + a second real SC deployment (T4).
+const rSpa = await runLenAndSC('Belgium (Spa) Race — length+SC', belgium, '2026-07-19T13:05:25+00:00');
+const lines = [`British: ${verdict(r1)}`, `Austria(switch): ${verdict(r2)}`, `Spa(len+SC): ${rSpa}`];
 // Switch BACK proves no stale track/transform carryover. Skipped in FAST mode to
 // stay within the OpenF1 30 req/min self-throttle for a quick single pass.
 if (!process.env.HARNESS_FAST) {

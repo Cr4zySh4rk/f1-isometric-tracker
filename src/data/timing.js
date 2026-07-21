@@ -75,14 +75,37 @@ export function inProgressLap(laps, driver, tMs) {
 
 // Current lap number / total up to T.
 export function currentLapAt(laps, tMs) {
-  let maxLap = 0;
+  const { lap, total } = lapAtTime(laps, tMs);
+  return { current: lap || 1, total };
+}
+
+// The race lap counter at replay time T — pure and replay-time-aware.
+// "Current lap" is the LEADER's lap: the greatest lap_number whose date_start
+// (for any driver) is ≤ T, since the leader is the first to start each lap.
+// Returns { lap, total, phase }:
+//   phase 'pre'      — T before any lap started (formation / grid) → lap 1
+//   phase 'racing'   — clamped to [1, total]
+//   phase 'finished' — T at/after the last lap's completion → lap = total
+//   total 0 / phase 'unknown' — no lap data at all (caller: show "LAP n" or hide)
+export function lapAtTime(laps, tMs) {
   let total = 0;
-  for (const lap of laps) {
-    if (lap.lap_number > total) total = lap.lap_number;
+  let current = 0;
+  let firstStart = Infinity;
+  let lastEnd = -Infinity;
+  for (const lap of laps || []) {
+    if (typeof lap.lap_number === 'number' && lap.lap_number > total) total = lap.lap_number;
     const ds = lap.date_start ? Date.parse(lap.date_start) : NaN;
-    if (!isNaN(ds) && ds <= tMs && lap.lap_number > maxLap) maxLap = lap.lap_number;
+    if (isNaN(ds)) continue;
+    if (ds < firstStart) firstStart = ds;
+    const dur = typeof lap.lap_duration === 'number' && lap.lap_duration > 0 ? lap.lap_duration * 1000 : 0;
+    if (ds + dur > lastEnd) lastEnd = ds + dur;
+    if (ds <= tMs && lap.lap_number > current) current = lap.lap_number;
   }
-  return { current: maxLap || 1, total: total || 0 };
+  if (!total) return { lap: 0, total: 0, phase: 'unknown' };
+  if (tMs < firstStart) return { lap: 1, total, phase: 'pre' };
+  const lap = Math.min(Math.max(current, 1), total); // post-chequered clamp
+  const phase = tMs >= lastEnd ? 'finished' : 'racing';
+  return { lap, total, phase };
 }
 
 // --- running order ----------------------------------------------------------

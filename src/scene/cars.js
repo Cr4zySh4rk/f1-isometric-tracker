@@ -8,6 +8,7 @@
 
 import * as THREE from 'three';
 import { inProgressLap } from '../data/timing.js';
+import { classifyEntrant } from '../data/entrants.js';
 import { fmtLiveLap } from '../util/format.js';
 
 const CAR_SCALE = 3.2; // scene units for car length-ish
@@ -62,6 +63,26 @@ export class CarManager {
   ensureCar(num) {
     let car = this.cars.get(num);
     if (car) return car;
+    // Telemetry numbers absent from /drivers are the FIA safety / medical cars
+    // (241/242/243 in real data — see data/entrants.js). They get a distinct
+    // road-car model, an SC/MED label, and are NOT raycast-pickable (no
+    // userData.driverNumber), so they can't be focused or crash the panel.
+    const kind = classifyEntrant(num, this.store.driversByNumber);
+    if (kind.type !== 'driver') {
+      const built = buildSafetyCar(kind.type);
+      const label = makeLabel(kind.label, '#ffb300');
+      label.position.set(0, 6.5, 0);
+      built.group.add(label);
+      built.group.visible = false;
+      this.group.add(built.group);
+      car = {
+        ...built, label, num, alpha: 1, lastHeading: 0,
+        cur: new THREE.Vector3(), tgt: new THREE.Vector3(), inited: false,
+        labelText: '', wheelSpin: 0, isSafety: true, kindLabel: kind.label,
+      };
+      this.cars.set(num, car);
+      return car;
+    }
     const color = new THREE.Color(this.store.teamColour(num));
     const built = sharedGLTF ? buildCarFromGLTF(color) : buildCar(color);
     const label = makeLabel(this.store.acronym(num), this.store.teamColour(num));
@@ -104,8 +125,9 @@ export class CarManager {
       car.cur.lerp(car.tgt, 0.5);
       car.group.position.copy(car.cur);
 
-      // Heading: OpenF1 world (x,y) → scene (x,z); scene heading = atan2(dz,dx).
-      let h = -s.heading + Math.PI / 2; // align model's +Z forward
+      // Heading: OpenF1 world (x,y) → scene (x,z = -y) (mirror fix in the
+      // shared transform): model +Z forward must track (dx, -dy) ⇒ h+π/2.
+      let h = s.heading + Math.PI / 2; // align model's +Z forward
       car.lastHeading = lerpAngle(car.lastHeading, h, 0.35);
       car.group.rotation.y = car.lastHeading;
 
@@ -119,6 +141,16 @@ export class CarManager {
       if (car.wheels && car.wheels.length) {
         car.wheelSpin += moved * 0.5;
         for (const w of car.wheels) w.rotation.x = car.wheelSpin;
+      }
+
+      // Safety/medical car: fixed SC/MED label, no lap timing.
+      if (car.isSafety) {
+        car.label.scale.set(6 * labelScale, 3.75 * labelScale, 1);
+        if (car.labelText !== car.kindLabel) {
+          car.labelText = car.kindLabel;
+          car.label.userData.redraw(car.kindLabel, '');
+        }
+        continue;
       }
 
       // Floating label: acronym + live current-lap time.
@@ -328,6 +360,64 @@ function buildCarFromGLTF(teamColor) {
   group.add(ring);
   group.add(makeHitProxy());
   return { group, bodyMat: allMats[0], allMats, wheels: [], ring };
+}
+
+// --- procedural safety / medical car ---------------------------------------
+
+// Low-poly road-car silhouette (closed cockpit + roof) with an amber light bar:
+// silver Mercedes-AMG-GT-like for the safety car, green Aston-Vantage-like for
+// the medical car. No selection ring and no hit proxy — not focusable.
+function buildSafetyCar(type /* 'safety' | 'medical' */) {
+  const group = new THREE.Group();
+  const allMats = [];
+  const bodyColor = type === 'medical' ? 0x1f6e3c : 0xcfd3d8; // green / silver
+  const bodyMat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.35, metalness: 0.55 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: 0x14161a, roughness: 0.6, metalness: 0.1 });
+  const amberMat = new THREE.MeshStandardMaterial({
+    color: 0xffb300, emissive: 0xff9900, emissiveIntensity: 0.9, roughness: 0.4,
+  });
+  allMats.push(bodyMat, darkMat, amberMat);
+
+  const L = CAR_SCALE;
+
+  // Body: low wide box with a tapered bonnet.
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.65, L * 1.7), bodyMat);
+  body.position.y = 0.55;
+  body.castShadow = true;
+  group.add(body);
+  const bonnet = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.42, L * 0.6), bodyMat);
+  bonnet.position.set(0, 0.5, L * 1.05);
+  bonnet.castShadow = true;
+  group.add(bonnet);
+
+  // Closed cockpit / roof (dark glasshouse under a body-color roof).
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.5, L * 0.85), darkMat);
+  glass.position.set(0, 1.05, -L * 0.1);
+  glass.castShadow = true;
+  group.add(glass);
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.12, L * 0.7), bodyMat);
+  roof.position.set(0, 1.35, -L * 0.12);
+  group.add(roof);
+
+  // Amber light bar across the roof.
+  const bar = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.16, 0.22), amberMat);
+  bar.position.set(0, 1.5, -L * 0.12);
+  group.add(bar);
+
+  // Wheels.
+  const wheelGeo = new THREE.CylinderGeometry(0.45, 0.45, 0.4, 12);
+  const wheels = [];
+  for (const [x, z] of [[0.8, L * 0.85], [-0.8, L * 0.85], [0.8, -L * 0.8], [-0.8, -L * 0.8]]) {
+    const w = new THREE.Mesh(wheelGeo, darkMat);
+    w.rotation.z = Math.PI / 2;
+    w.position.set(x, 0.45, z);
+    w.castShadow = true;
+    group.add(w);
+    wheels.push(w);
+  }
+
+  group.scale.setScalar(1.1);
+  return { group, bodyMat, allMats, wheels, ring: null };
 }
 
 // --- billboard label sprite -------------------------------------------------

@@ -8,6 +8,7 @@ import { SessionStore } from './data/sessionStore.js';
 import { ReplayBuffer } from './data/replayBuffer.js';
 import { ApproxBuffer } from './data/approxBuffer.js';
 import { PlaybackClock } from './engine/clock.js';
+import { BufferGate } from './engine/bufferGate.js';
 import { buildTrack } from './track/trackBuilder.js';
 import { Hud } from './ui/hud.js';
 import { DriverPanel } from './ui/driverPanel.js';
@@ -388,6 +389,7 @@ function reopenPicker() {
 // --- main loop -------------------------------------------------------------
 
 let lastFrame = 0;
+const bufferGate = new BufferGate(); // hold/release "Buffering…" state machine
 function startLoop() {
   if (running) return;
   running = true;
@@ -397,16 +399,21 @@ function startLoop() {
     lastFrame = now;
 
     if (clock && buffer && carMgr) {
-      // Buffering: while the cursor window isn't loaded yet (e.g. a seek far
-      // outside the fetched windows), hold the clock so playback doesn't run
-      // blindly through unfetched data, and show a small indicator. The buffer
-      // keeps fetching/retrying via update(), so this can't get stuck.
+      // Buffering gate: while the cursor window isn't loaded yet (e.g. a seek far
+      // outside the fetched windows, or prefetch starvation at high speed), HOLD
+      // the clock so playback doesn't run blindly through unfetched data, and show
+      // a small indicator. The buffer keeps fetching/retrying via update() below,
+      // so this can't get stuck — the gate releases the moment data arrives.
       const buffered = !buffer.isCursorBuffered || buffer.isCursorBuffered(clock.t);
-      if (!buffered && clock.playing && !clock.live) clock.hold(now);
-      setBuffering(!buffered);
+      const gate = bufferGate.update({ buffered, playing: clock.playing, live: clock.live });
+      if (gate.hold) clock.hold(now);
+      setBuffering(gate.chip);
 
       const t = clock.tick(now);
-      buffer.update(t);
+      // Pass the playback speed so the prefetcher scales its window size / interval
+      // stride to stay inside the OpenF1 30 req/min budget (data/windowPlan.js) —
+      // otherwise fixed 90 s windows starve at 30× and cars vanish.
+      buffer.update(t, clock.speed);
       const samples = buffer.sampleAll(t);
       carMgr.update(samples, dt, t);
 

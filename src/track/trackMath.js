@@ -127,6 +127,135 @@ export function arcLengths(pts) {
   return { cumLen, totalLen };
 }
 
+// --- fidelity pipeline (median centerline + adaptive resampling) ------------
+
+// Pointwise-MEDIAN centerline from several laps of the same circuit.
+// Each trace is resampled to n points by arc length, circularly aligned to the
+// first trace (small phase offsets from differing racing lines / trim points),
+// then the per-index median of x and y is taken. The median kills single-lap
+// GPS jitter without rounding corners the way heavy smoothing does.
+export function medianCenterline(traces, n) {
+  const laps = traces
+    .filter((t) => Array.isArray(t) && t.length >= 20)
+    .map((t) => resampleByArcLength(t, n));
+  if (!laps.length) return [];
+  if (laps.length === 1) return laps[0];
+
+  const ref = laps[0];
+  const aligned = [ref];
+  for (let j = 1; j < laps.length; j++) {
+    aligned.push(alignCircular(laps[j], ref));
+  }
+  const out = new Array(n);
+  const xs = new Array(aligned.length);
+  const ys = new Array(aligned.length);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < aligned.length; j++) {
+      xs[j] = aligned[j][i].x;
+      ys[j] = aligned[j][i].y;
+    }
+    out[i] = { x: median(xs.slice()), y: median(ys.slice()) };
+  }
+  return out;
+}
+
+// Circularly shift `pts` so it best matches `ref` (both length n, same
+// direction). Searches a small window of index offsets.
+export function alignCircular(pts, ref, searchWindow = 12) {
+  const n = pts.length;
+  const stride = Math.max(1, Math.floor(n / 64)); // subsample the cost function
+  let bestOff = 0;
+  let bestCost = Infinity;
+  for (let off = -searchWindow; off <= searchWindow; off++) {
+    let cost = 0;
+    for (let i = 0; i < n; i += stride) {
+      const p = pts[(i + off + n) % n];
+      const r = ref[i];
+      cost += (p.x - r.x) ** 2 + (p.y - r.y) ** 2;
+    }
+    if (cost < bestCost) { bestCost = cost; bestOff = off; }
+  }
+  if (bestOff === 0) return pts;
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = pts[(i + bestOff + n) % n];
+  return out;
+}
+
+function median(arr) {
+  arr.sort((a, b) => a - b);
+  const m = arr.length >> 1;
+  return arr.length % 2 ? arr[m] : (arr[m - 1] + arr[m]) / 2;
+}
+
+// ADAPTIVE resampling of a closed loop: n points distributed by a curvature-
+// weighted arc measure, so chicanes/hairpins get dense points (their true shape
+// survives later smoothing) while straights use few. `tension` controls how
+// strongly density follows curvature (0 = uniform).
+export function resampleAdaptive(pts, n, { tension = 3 } = {}) {
+  const m = pts.length;
+  if (m < 3) return pts.slice();
+  // Smooth the curvature signal a little so weighting is stable against noise.
+  const rawCurv = curvature(pts);
+  const curv = new Array(m);
+  for (let i = 0; i < m; i++) {
+    curv[i] = (rawCurv[(i - 1 + m) % m] + rawCurv[i] * 2 + rawCurv[(i + 1) % m]) / 4;
+  }
+  const maxCurv = Math.max(...curv, 1e-9);
+
+  // Weighted cumulative measure around the closed loop.
+  const wcum = new Array(m + 1);
+  wcum[0] = 0;
+  for (let i = 0; i < m; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % m];
+    const seg = Math.hypot(b.x - a.x, b.y - a.y);
+    const c = (curv[i] + curv[(i + 1) % m]) / 2;
+    wcum[i + 1] = wcum[i] + seg * (1 + tension * (c / maxCurv));
+  }
+  const total = wcum[m] || 1;
+
+  const out = new Array(n);
+  let j = 1;
+  for (let i = 0; i < n; i++) {
+    const d = (i / n) * total;
+    while (j <= m && wcum[j] < d) j++;
+    const k = Math.min(j, m);
+    const segW = wcum[k] - wcum[k - 1] || 1;
+    const u = (d - wcum[k - 1]) / segW;
+    const a = pts[k - 1];
+    const b = pts[k % m];
+    out[i] = { x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u };
+  }
+  return out;
+}
+
+// Curvature-aware Laplacian smoothing of a closed loop: each point relaxes
+// toward the midpoint of its neighbors by `lambda`, ATTENUATED where curvature
+// is high so tight corners keep their true shape (straights get the full
+// de-jitter). Position-preserving (no phase shift), unlike repeated
+// Catmull-Rom midpoint passes.
+export function smoothAdaptive(pts, { lambda = 0.35, passes = 2, cornerKeep = 0.85 } = {}) {
+  let cur = pts;
+  for (let p = 0; p < passes; p++) {
+    const n = cur.length;
+    const curv = curvature(cur);
+    const maxCurv = Math.max(...curv, 1e-9);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = cur[(i - 1 + n) % n];
+      const b = cur[i];
+      const c = cur[(i + 1) % n];
+      const lam = lambda * (1 - cornerKeep * (curv[i] / maxCurv));
+      out[i] = {
+        x: b.x + ((a.x + c.x) / 2 - b.x) * lam,
+        y: b.y + ((a.y + c.y) / 2 - b.y) * lam,
+      };
+    }
+    cur = out;
+  }
+  return cur;
+}
+
 export function syntheticOval(N = 400, a = 8000, b = 5000) {
   const pts = [];
   for (let i = 0; i < N; i++) {

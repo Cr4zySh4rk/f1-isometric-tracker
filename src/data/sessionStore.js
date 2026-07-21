@@ -6,9 +6,11 @@ import { OpenF1Provider } from './providers/openf1Provider.js';
 import { normalizeRaceControl, trackStatusAt, penaltiesAt } from './raceControl.js';
 import {
   fastestLapAt, bestLapByDriverAt, currentLapAt, lastCompletedLap,
-  startingPositions, isInPitAt,
+  startingPositions, isInPitAt, inProgressLap,
 } from './timing.js';
 import { classifiedOut, retirementTimeMs, isRetiredAt } from './retirement.js';
+import { stintsByDriver, compoundAt as compoundAtLap, tyreAgeAt as tyreAgeAtLap } from './stints.js';
+import { normalizeWeather, weatherAt as weatherAtT } from './weather.js';
 
 const LS_PREFIX = 'f1iso.session.';
 
@@ -44,7 +46,18 @@ export class SessionStore {
     this.rcEvents = []; // normalized + sorted race_control (with tMs)
     this.pit = [];
     this.result = [];
+    this.stints = new Map(); // driver_number -> stint rows (sorted by lap_start)
+    this.weather = []; // normalized weather timeline (sorted by t)
+    this.teamRadio = []; // raw team_radio rows (all drivers)
     this._loaded = false;
+  }
+
+  // True when the active source exposes real telemetry (car_data/stints/weather).
+  // Approximate (Jolpica) mode has none → panel/widgets show "unavailable".
+  hasTelemetry() {
+    const s = this.source;
+    if (s && typeof s.telemetry === 'boolean') return s.telemetry; // ProviderManager
+    return !!(s && s.capabilities && s.capabilities.telemetry);
   }
 
   isRace() {
@@ -64,13 +77,17 @@ export class SessionStore {
 
     const src = this.source;
     const s = this.session;
-    const [drivers, laps, positions, raceControl, pit, result] = await Promise.all([
+    const [drivers, laps, positions, raceControl, pit, result, stints, weather, teamRadio] = await Promise.all([
       cachedDrivers ? Promise.resolve(cachedDrivers) : safe(() => src.getDrivers(s), []),
       cachedLaps ? Promise.resolve(cachedLaps) : safe(() => src.getLaps(s), []),
       safe(() => src.getPositions(s), []),
       safe(() => src.getRaceControl(s), []),
       safe(() => src.getPit(s), []),
       safe(() => (src.getSessionResult ? src.getSessionResult(s) : []), []),
+      // Enriched-panel / weather feeds (OpenF1 only; Jolpica returns []).
+      safe(() => (src.getStints ? src.getStints(s) : []), []),
+      safe(() => (src.getWeather ? src.getWeather(s) : []), []),
+      safe(() => (src.getTeamRadio ? src.getTeamRadio(s) : []), []),
     ]);
 
     this.drivers = normalizeDrivers(drivers);
@@ -80,6 +97,11 @@ export class SessionStore {
     this.rcEvents = normalizeRaceControl(this.raceControl);
     this.pit = Array.isArray(pit) ? pit : [];
     this.result = Array.isArray(result) ? result : [];
+    // Tyre stints grouped by driver; weather timeline sorted by time; raw radio
+    // clip rows (RadioController normalises per-driver, replay-time-aware).
+    this.stints = stintsByDriver(Array.isArray(stints) ? stints : []);
+    this.weather = normalizeWeather(Array.isArray(weather) ? weather : []);
+    this.teamRadio = Array.isArray(teamRadio) ? teamRadio : [];
     this._startPositions = startingPositions(this.positions);
     this._buildRetirements();
 
@@ -164,6 +186,31 @@ export class SessionStore {
   // Is the driver in the pits at time T?
   isInPitAt(num, tMs) {
     return isInPitAt(this.pit, num, tMs);
+  }
+
+  // --- tyres / weather / radio (replay-time-aware, at session time T) --------
+
+  // The lap number a driver is on at T (in-progress lap; falls back to the
+  // leader-derived current lap when the driver has no started-lap row yet).
+  lapNumberAt(num, tMs) {
+    const cur = inProgressLap(this.laps, num, tMs);
+    if (cur && cur.lap_number != null) return cur.lap_number;
+    return this.currentLapAt(tMs).current;
+  }
+
+  // Tyre compound (upper-case string) on the driver's tyre at T, or null.
+  compoundAt(num, tMs) {
+    return compoundAtLap(this.stints.get(num), this.lapNumberAt(num, tMs));
+  }
+
+  // Tyre age in laps at T, or null.
+  tyreAgeAt(num, tMs) {
+    return tyreAgeAtLap(this.stints.get(num), this.lapNumberAt(num, tMs));
+  }
+
+  // Latest weather sample at or before T (or the first sample before session), null if none.
+  weatherAt(tMs) {
+    return weatherAtT(this.weather, tMs);
   }
 
   // --- retirement / DNF -----------------------------------------------------

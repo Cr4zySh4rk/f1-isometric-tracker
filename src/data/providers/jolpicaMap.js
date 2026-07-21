@@ -19,6 +19,8 @@ export const CONSTRUCTOR_COLOURS = {
   alpine: '0093cc',
   williams: '64c4ff',
   rb: '6692ff',
+  audi: '00e0c6',       // 2026 Audi works team (ex-Sauber)
+  cadillac: 'c8a45c',   // 2026 Cadillac F1 entry
   alphatauri: '5e8faa',
   sauber: '52e252',
   alfa: 'c92d4b',

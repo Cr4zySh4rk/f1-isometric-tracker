@@ -135,6 +135,71 @@ Cars orient along velocity vector; wheels spin with speed.
   (`buildTowerRows` `retiredFn`), and the follow camera releases with a toast if
   the followed car retires (`main.js`).
 
+### Recent upgrades (T8 — enriched panel, radio, weather & standings)
+All four are **replay-time-aware** (state as of session time T) and keep pure,
+unit-tested logic separate from a thin DOM/audio shell. Data comes from new
+per-session OpenF1 tables and the Jolpica standings endpoint. Every stateful
+object disposes on unfocus and session switch, so nothing leaks.
+
+New/extended endpoints (all fetched once per session, URL-cached):
+`/stints`, `/team_radio`, `/weather`, plus the windowed single-driver
+`/car_data?driver_number` for the focused telemetry buffer. `SessionStore.load()`
+now loads stints/weather/teamRadio and exposes `compoundAt(num,T)`,
+`tyreAgeAt(num,T)`, `weatherAt(T)` and `lapNumberAt(num,T)` accessors (Jolpica
+returns empty for all of these, so Approximate mode degrades to "unavailable").
+
+```
+src/data/telemetry.js   pure car_data helpers (drsState ≥10=OPEN, gearLabel,
+                        parseCarSample, latestAtOrBefore) + FocusedTelemetry —
+                        a small windowed /car_data buffer for the ONE focused
+                        driver (prefetch a window around T, window size scales
+                        with playback speed via windowPlan, evict behind, stop/
+                        dispose on unfocus + switch; provider→null ⇒ unavailable)
+src/data/stints.js      compoundAt / tyreAgeAt / compoundInfo (tyre colours)
+src/data/weather.js     weatherAt(T) (latest ≤ T; first sample before session),
+                        isRaining, windCompass
+src/data/radio.js       normalizeClips / latestClipAtOrBefore / clipsUpTo
+                        (only ever surfaces clips whose date ≤ T)
+src/data/standings.js   meetingToRound (closest scheduled race to the meeting
+                        date), standingsRoundToShow (previous round; round 1→0),
+                        mapDriver/ConstructorStandings (Ergast → compact rows)
+src/ui/driverPanel.js   enriched: SPEED (prominent), THROTTLE/BRAKE bars, GEAR,
+                        RPM, DRS chip, tyre dot+age. Keeps a stable skeleton
+                        (#dp-body rebuilt each frame + a #dp-radio mount the
+                        RadioController owns) so re-render never kills audio.
+src/ui/radio.js         RadioController — plain <audio> (OpenF1 mp3 plays without
+                        CORS). On focus (a user click ⇒ gesture) autoplays the
+                        latest clip ≤ T unless muted; MUTE persisted in
+                        localStorage (default UNMUTED). play() rejection ⇒ a
+                        "tap to play" state, no error. Stops/replaces on unfocus,
+                        focus change, session switch. Hidden in Approx mode.
+src/ui/weatherWidget.js top-right; air/track °C, humidity, wind arrow, DRY/RAIN
+src/ui/standingsWidget.js top-right below weather; driver/constructor table
+                        (toggle), constructor-colour accent, cached per (season,
+                        round), "standings unavailable" on failure
+```
+
+- **Autoplay handling.** Focus always originates from a user gesture (tower
+  click / car click / `f`), so the default autoplay of the latest clip ≤ T is
+  permitted. If `audio.play()` still rejects (e.g. a browser autoplay policy),
+  the controller catches it and shows a *tap to play* affordance — never an
+  error. Muted ⇒ never autoplays; the mute state is persisted.
+- **Standings round-mapping.** The season schedule (`/{season}.json`) is matched
+  to the loaded meeting by the scheduled race date closest to the meeting's
+  `date_start` → the meeting's round R. Standings shown are those *going into*
+  the race, i.e. **after round R-1** (`standingsRoundToShow`; R=1 → "season
+  opener, no prior standings"). Jolpica is always CORS-open, so standings load
+  regardless of the OpenF1 failover state. Cached per (season, round).
+- **The right-hand stack** (weather + standings) is hidden until a session loads
+  (the app opens to the picker; nothing auto-loads) and is positioned top-right
+  so it never collides with the top bar / lap counter / timing tower / transport
+  / focused-driver panel.
+- **Real-data validation** (`npm run verify:real`, session 11326 = 2026 British
+  GP): focused `/car_data` at a real T → speed 310 km/h, gear 8, DRS chip;
+  `/stints` → MEDIUM, age 3 laps; `weatherAt(T)` → air 24.5 °C / track 41.7 °C /
+  DRY; a real `/team_radio` mp3 URL is present; Jolpica maps the meeting to
+  round 9 and shows the round-8 standings with 22 drivers.
+
 ### Playback vs live
 One code path: the replay engine always renders "session time T". In replay, T is
 driven by the playback clock. In live mode, T = now − 3 s and the buffer polls the

@@ -49,6 +49,14 @@ export class JolpicaProvider {
   async getRaceControl() { return []; }
   async getPit() { return []; }
 
+  // Ergast has no tyre-stint / team-radio / weather feeds. Return empty so the
+  // enriched panel + weather widget degrade gracefully ("unavailable"). Weather
+  // returns [] and car_data null (no telemetry), matching the telemetry gate.
+  async getStints() { return []; }
+  async getTeamRadio() { return []; }
+  async getWeather() { return []; }
+  async getCarData() { return null; }
+
   // No telemetry: signal callers to use Approximate mode. null (not []) is the
   // explicit "provider has no location data at all" contract.
   async getLocationWindow() { return null; }

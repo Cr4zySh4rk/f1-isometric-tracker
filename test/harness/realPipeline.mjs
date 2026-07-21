@@ -78,6 +78,11 @@ const { classifyEntrant } = await import('../../src/data/entrants.js');
 // tangent) and DNF removal (retirementDisplayAt + store.retiredAt).
 const { chooseHeading, SLOW_SPEED } = await import('../../src/engine/interp.js');
 const { retirementDisplayAt } = await import('../../src/data/retirement.js');
+// This pass: focused-driver telemetry, tyre stints, weather, team radio, and
+// Jolpica championship standings (FEATURES 1–4).
+const { parseCarSample, latestAtOrBefore, gearLabel, drsState } = await import('../../src/data/telemetry.js');
+const { jolpicaRaw } = await import('../../src/api/jolpica.js');
+const { meetingToRound, standingsRoundToShow, mapDriverStandings } = await import('../../src/data/standings.js');
 
 const angDiff = (a, b) => {
   let d = a - b;
@@ -334,6 +339,63 @@ function followCameraCheck(track, buffer, fromMs, bb) {
   return { ok, num, dist, inFrame };
 }
 
+// FEATURES 1–4 — enriched panel telemetry, tyre stints, weather widget, team
+// radio, championship standings. All read the SAME real feeds main.js uses.
+async function featureChecks(store, session) {
+  const startMs = Date.parse(store.timeWindow().start);
+  const T = startMs + 600000; // ~10 min in (green-flag racing)
+  const num = store.drivers.length ? store.drivers[0].driver_number : 1;
+
+  // FEATURE 1a — focused-driver /car_data: finite speed + a real gear at T.
+  const aISO = new Date(T - 1500).toISOString();
+  const bISO = new Date(T + 1500).toISOString();
+  const rows = await providers.getCarData(session, num, aISO, bISO);
+  const parsed = (Array.isArray(rows) ? rows : []).map(parseCarSample).filter(Boolean).sort((x, y) => x.t - y.t);
+  const s = latestAtOrBefore(parsed, T);
+  const carOk = !!(s && Number.isFinite(s.speed) && s.gear != null && Number.isFinite(s.gear) && s.t <= T);
+
+  // FEATURE 1b — tyre stint compound + age at T (via the store accessors).
+  const compound = store.compoundAt(num, T);
+  const age = store.tyreAgeAt(num, T);
+  const stintsOk = !!compound && Number.isFinite(age);
+
+  // FEATURE 3 — weatherAt(T): finite air + track temperature.
+  const w = store.weatherAt(T);
+  const wxOk = !!(w && Number.isFinite(Number(w.air_temperature)) && Number.isFinite(Number(w.track_temperature)));
+
+  // FEATURE 2 — a real team-radio mp3 URL exists.
+  const radios = await providers.getTeamRadio(session);
+  const clip = (Array.isArray(radios) ? radios : []).find((r) => r && /\.mp3(\?|$)/i.test(r.recording_url || ''));
+  const radioOk = !!clip;
+
+  // FEATURE 4 — Jolpica standings map to a plausible round with > 0 drivers.
+  const season = session.year || new Date(startMs).getUTCFullYear();
+  let round = null, showRound = 0, driverCount = 0;
+  try {
+    const schedMr = await jolpicaRaw(`${season}`);
+    const races = schedMr?.RaceTable?.Races || [];
+    const map = meetingToRound(races, Date.parse(session.date_start), season);
+    if (map) { round = map.round; showRound = standingsRoundToShow(round); }
+    if (showRound > 0) {
+      const dMr = await jolpicaRaw(`${season}/${showRound}/driverStandings`);
+      const dList = dMr?.StandingsTable?.StandingsLists?.[0] || {};
+      driverCount = mapDriverStandings(dList).length;
+    }
+  } catch { /* leave standingsOk false */ }
+  const standingsOk = round >= 1 && showRound > 0 && driverCount > 0;
+
+  const ok = carOk && stintsOk && wxOk && radioOk && standingsOk;
+  return {
+    ok, num,
+    speed: s ? s.speed : null, gear: s ? gearLabel(s.gear) : null, drs: s ? drsState(s.drs) : null,
+    compound, age, air: w ? w.air_temperature : null, track: w ? w.track_temperature : null,
+    rain: w ? Number(w.rainfall) > 0 : null,
+    radioUrl: clip ? clip.recording_url.split('/').pop() : null,
+    round, showRound, driverCount,
+    carOk, stintsOk, wxOk, radioOk, standingsOk,
+  };
+}
+
 async function runSession(label, session, opts = {}) {
   console.log(`\n=== ${label} : session_key=${session.session_key} (${session.circuit_short_name}) ===`);
   const store = new SessionStore(session, providers);
@@ -429,7 +491,19 @@ async function runSession(label, session, opts = {}) {
       ` removedWhileParked=${dnf.removedWhileParked}(parkedSpeed=${dnf.parkedSpeed}dm/s) retiredAfter=${dnf.retiredAfter} presentAgainEarlier=${dnf.presentAgain}`);
   }
 
-  return { synthetic, results, bb, follow, len, lap, novanish, sc, grid, dnf };
+  // FEATURES 1–4: enriched telemetry, tyre, weather, radio, standings.
+  let feat = { ok: true, skipped: true };
+  if (opts.features && !synthetic) {
+    feat = await featureChecks(store, session);
+    console.log(`  FEAT panel/telemetry+tyre+weather+radio+standings: ok=${feat.ok}` +
+      ` | #${feat.num} speed=${feat.speed}km/h gear=${feat.gear} drs=${feat.drs}` +
+      ` tyre=${feat.compound}(${feat.age} laps) air=${feat.air}°C track=${feat.track}°C rain=${feat.rain}` +
+      ` radio=${feat.radioUrl}` +
+      ` standings=R${feat.round}→showR${feat.showRound}(${feat.driverCount} drivers)` +
+      ` [car=${feat.carOk} stints=${feat.stintsOk} wx=${feat.wxOk} radio=${feat.radioOk} standings=${feat.standingsOk}]`);
+  }
+
+  return { synthetic, results, bb, follow, len, lap, novanish, sc, grid, dnf, feat };
 }
 
 // Pick two real completed races from 2026 (a genuine session switch across
@@ -473,14 +547,16 @@ function verdict(r, { minWithin = 15 } = {}) {
   const t4 = !r.sc || r.sc.ok;
   const grid = !r.grid || r.grid.ok;
   const dnf = !r.dnf || r.dnf.ok;
-  const pass = cars && follow && len && lap && t1 && t4 && grid && dnf;
-  return pass ? 'PASS' : `FAIL(cars=${cars} follow=${follow} len=${len} lap=${lap} t1=${t1} t4=${t4} grid=${grid} dnf=${dnf})`;
+  const feat = !r.feat || r.feat.ok;
+  const pass = cars && follow && len && lap && t1 && t4 && grid && dnf && feat;
+  return pass ? 'PASS' : `FAIL(cars=${cars} follow=${follow} len=${len} lap=${lap} t1=${t1} t4=${t4} grid=${grid} dnf=${dnf} feat=${feat})`;
 }
 
 const r1 = await runSession('British GP (Silverstone) Race', british, {
   scDate: '2026-07-05T15:18:50+00:00', // first SAFETY CAR DEPLOYED (verified)
   gridHeading: true, // ITEM 1: grid cars square to the track tangent
   dnfNum: 27, // ITEM 3: HUL retired lap 37 (session_result dnf=true, verified)
+  features: true, // FEATURES 1–4: telemetry / tyre / weather / radio / standings
 });
 const r2 = await runSession('Austria (Spielberg) Race — SWITCH', austria);
 // Third circuit (Spa) for T2 length fidelity + a second real SC deployment (T4).

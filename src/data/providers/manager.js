@@ -119,8 +119,12 @@ export class ProviderManager {
   getRaceControl(session) { return this.run((p) => p.getRaceControl(session), { reason: 'race_control' }); }
   getPit(session) { return this.run((p) => p.getPit(session), { reason: 'pit' }); }
   getSessionResult(session) { return this.run((p) => p.getSessionResult(session), { reason: 'session_result' }); }
+  getStints(session) { return this.run((p) => (p.getStints ? p.getStints(session) : []), { reason: 'stints' }); }
+  getTeamRadio(session) { return this.run((p) => (p.getTeamRadio ? p.getTeamRadio(session) : []), { reason: 'team_radio' }); }
+  getWeather(session) { return this.run((p) => (p.getWeather ? p.getWeather(session) : []), { reason: 'weather' }); }
   getLocationWindow(session, a, b) { return this.run((p) => p.getLocationWindow(session, a, b), { reason: 'location' }); }
   getIntervals(session, a, b) { return this.run((p) => p.getIntervals(session, a, b), { reason: 'intervals' }); }
+  getCarData(session, num, a, b) { return this.run((p) => (p.getCarData ? p.getCarData(session, num, a, b) : null), { reason: 'car_data' }); }
 
   startRecoveryPoll(ms = 60000) {
     if (this._pollHandle != null) return;

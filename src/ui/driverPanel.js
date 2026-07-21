@@ -1,5 +1,13 @@
-// Focused-driver panel: name, team, number, position, current lap + live lap
-// time, last lap, best lap, and sector 1/2/3 times colored purple/green/yellow.
+// Focused-driver panel: identity + timing (position, current/last/best lap,
+// S1/S2/S3 colours) PLUS replay-time-aware telemetry at T (speed, throttle/brake
+// bars, gear, rpm, DRS), the current tyre (compound-coloured dot + age), and a
+// team-radio control. Telemetry/tyre/radio come from real /car_data + /stints +
+// /team_radio; in Approximate (Jolpica) mode they read "telemetry unavailable".
+//
+// DOM is thin: the pure logic (drsState/gearLabel/parseCarSample, compoundInfo,
+// tyreAgeAt, radio selection) lives in unit-tested data modules. The panel keeps
+// a stable skeleton (a rebuilt #dp-body plus a radio mount the RadioController
+// owns) so re-rendering never tears down active audio.
 
 import {
   inProgressLap, lastCompletedLap, bestLapByDriverAt, sectorBestsAt,
@@ -8,26 +16,44 @@ import {
 import { raceOrderAt, practiceOrderAt } from '../data/timing.js';
 import { sectorColorState } from '../data/sectors.js';
 import { fmtLapTime, fmtLiveLap } from '../util/format.js';
+import { drsState, gearLabel } from '../data/telemetry.js';
+import { compoundInfo } from '../data/stints.js';
 
 export class DriverPanel {
   constructor({ store }) {
     this.store = store;
     this.num = null;
     this.el = document.getElementById('driver-panel');
+    this.telemetry = null; // FocusedTelemetry (set by main.js)
+    this.radio = null;     // RadioController (set by main.js)
+    this._built = false;
   }
 
   show(num) {
     this.num = num;
+    this._built = false; // force skeleton rebuild for the new driver
     this.el.classList.remove('hidden');
   }
 
   hide() {
     this.num = null;
+    this._built = false;
     this.el.classList.add('hidden');
+    this.el.innerHTML = '';
+  }
+
+  // Build the stable skeleton once per focus: a #dp-body (rebuilt each frame)
+  // and a #dp-radio mount the RadioController owns (never clobbered here).
+  _buildSkeleton() {
+    this.el.innerHTML = '<div id="dp-body"></div><div id="dp-radio" class="dp-radio"></div>';
+    this._body = this.el.querySelector('#dp-body');
+    if (this.radio) this.radio.attach(this.el.querySelector('#dp-radio'));
+    this._built = true;
   }
 
   update(tMs) {
     if (this.num == null) return;
+    if (!this._built || this._lastNum !== this.num) this._buildSkeleton();
     // Throttle DOM rebuilds to ~10 Hz (wall clock); live timer shows tenths.
     const wall = Date.now();
     if (this._lastWall && wall - this._lastWall < 90 && this._lastNum === this.num) return;
@@ -62,7 +88,7 @@ export class DriverPanel {
       return { time: s, state };
     });
 
-    this.el.innerHTML = `
+    this._body.innerHTML = `
       <div class="dp-head" style="border-left-color:${color}">
         <span class="dp-num">${num}</span>
         <div class="dp-id">
@@ -71,6 +97,7 @@ export class DriverPanel {
         </div>
         <button class="dp-close" id="dp-close" title="Unfocus (Esc)">×</button>
       </div>
+      ${this._telemetryHtml(num, tMs)}
       <div class="dp-grid">
         <div class="dp-cell"><span class="dp-k">POS</span><span class="dp-v">${pos}</span></div>
         <div class="dp-cell"><span class="dp-k">LAP</span><span class="dp-v">${lapNo || '—'}</span></div>
@@ -88,8 +115,66 @@ export class DriverPanel {
           </div>`).join('')}
       </div>`;
 
-    const closeBtn = this.el.querySelector('#dp-close');
+    const closeBtn = this._body.querySelector('#dp-close');
     if (closeBtn && this.onClose) closeBtn.addEventListener('click', () => this.onClose());
+
+    // Radio list refresh (owns its own mount; audio persists across renders).
+    if (this.radio) this.radio.update(tMs);
+  }
+
+  // Telemetry + tyre block. In Approximate mode (no telemetry) → a clear notice.
+  _telemetryHtml(num, tMs) {
+    if (!this.store.hasTelemetry()) {
+      return '<div class="dp-telem dp-telem-off">Telemetry unavailable (Approx mode)</div>';
+    }
+    const s = this.telemetry ? this.telemetry.sampleAt(tMs) : null;
+    const compound = this.store.compoundAt(num, tMs);
+    const age = this.store.tyreAgeAt(num, tMs);
+    const ci = compoundInfo(compound);
+
+    if (!s) {
+      // Buffer warming up around T (or a gap) — show the tyre, telemetry pending.
+      return `
+        <div class="dp-telem">
+          <div class="dp-speed"><span class="dp-speed-v">—</span><span class="dp-speed-u">km/h</span></div>
+          <div class="dp-telem-pending">telemetry…</div>
+          ${this._tyreHtml(ci, age)}
+        </div>`;
+    }
+
+    const speed = s.speed != null ? Math.round(s.speed) : '—';
+    const thr = s.throttle != null ? Math.round(s.throttle) : 0;
+    const brk = s.brake != null ? Math.round(s.brake) : 0;
+    const gear = gearLabel(s.gear);
+    const rpm = s.rpm != null ? Math.round(s.rpm).toLocaleString() : '—';
+    const drs = drsState(s.drs);
+
+    return `
+      <div class="dp-telem">
+        <div class="dp-speed">
+          <span class="dp-speed-v">${speed}</span><span class="dp-speed-u">km/h</span>
+        </div>
+        <div class="dp-bars">
+          <div class="dp-bar"><span class="dp-bar-k">THR</span><div class="dp-bar-track"><div class="dp-bar-fill dp-thr" style="width:${thr}%"></div></div></div>
+          <div class="dp-bar"><span class="dp-bar-k">BRK</span><div class="dp-bar-track"><div class="dp-bar-fill dp-brk" style="width:${brk}%"></div></div></div>
+        </div>
+        <div class="dp-telem-row">
+          <div class="dp-chip"><span class="dp-chip-k">GEAR</span><span class="dp-chip-v">${gear}</span></div>
+          <div class="dp-chip"><span class="dp-chip-k">RPM</span><span class="dp-chip-v">${rpm}</span></div>
+          <div class="dp-chip dp-drs ${drs === 'OPEN' ? 'drs-open' : 'drs-closed'}"><span class="dp-chip-k">DRS</span><span class="dp-chip-v">${drs}</span></div>
+        </div>
+        ${this._tyreHtml(ci, age)}
+      </div>`;
+  }
+
+  _tyreHtml(ci, age) {
+    const ageLabel = Number.isFinite(age) ? `${age} lap${age === 1 ? '' : 's'}` : '—';
+    return `
+      <div class="dp-tyre">
+        <span class="dp-tyre-dot" style="background:${ci.color}"></span>
+        <span class="dp-tyre-label">${ci.label}</span>
+        <span class="dp-tyre-age">${ageLabel}</span>
+      </div>`;
   }
 }
 

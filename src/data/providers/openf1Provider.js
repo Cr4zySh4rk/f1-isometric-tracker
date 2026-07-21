@@ -38,11 +38,20 @@ export class OpenF1Provider {
   getPit(session) { return OpenF1.pit(keyOf(session)); }
   getSessionResult(session) { return OpenF1.sessionResult(keyOf(session)); }
 
+  // Per-session tables for the enriched panel / weather widget.
+  getStints(session) { return OpenF1.stints(keyOf(session)); }
+  getTeamRadio(session) { return OpenF1.teamRadio(keyOf(session)); }
+  getWeather(session) { return OpenF1.weather(keyOf(session)); }
+
   getLocationWindow(session, aISO, bISO) {
     return OpenF1.location(keyOf(session), aISO, bISO);
   }
   getIntervals(session, aISO, bISO) {
     return OpenF1.intervals(keyOf(session), aISO, bISO);
+  }
+  // Focused-driver telemetry window (single driver).
+  getCarData(session, driverNumber, aISO, bISO) {
+    return OpenF1.carData(keyOf(session), driverNumber, aISO, bISO);
   }
 
   probe() { return probeAvailable(); }

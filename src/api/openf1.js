@@ -184,12 +184,21 @@ export const OpenF1 = {
   raceControl: (session_key) => api('race_control', { session_key }),
   pit: (session_key) => api('pit', { session_key }),
   sessionResult: (session_key) => api('session_result', { session_key }),
-  // Windowed requests: not URL-cached — the ReplayBuffer owns eviction, so
-  // caching raw JSON here would duplicate memory and grow unbounded.
+  // Small per-session tables (fetched once, URL-cached): tyre stints, team radio
+  // clip list, and weather timeline. All return every driver's rows in one call.
+  stints: (session_key) => api('stints', { session_key }),
+  teamRadio: (session_key) => api('team_radio', { session_key }),
+  weather: (session_key) => api('weather', { session_key }),
+  // Windowed requests: not URL-cached — the ReplayBuffer / focused telemetry
+  // buffer own eviction, so caching raw JSON here would duplicate memory and
+  // grow unbounded.
   location: (session_key, startISO, endISO) =>
     api('location', { session_key, date_gt: startISO, date_lt: endISO }, { cache: false }),
   intervals: (session_key, startISO, endISO) =>
     api('intervals', { session_key, date_gt: startISO, date_lt: endISO }, { cache: false }),
+  // Focused-driver telemetry window (single driver, windowed like /location).
+  carData: (session_key, driver_number, startISO, endISO) =>
+    api('car_data', { session_key, driver_number, date_gt: startISO, date_lt: endISO }, { cache: false }),
 };
 
 // Utility for callers that need a quick availability probe (returns true if the

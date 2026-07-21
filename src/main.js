@@ -12,6 +12,10 @@ import { BufferGate } from './engine/bufferGate.js';
 import { buildTrack } from './track/trackBuilder.js';
 import { Hud } from './ui/hud.js';
 import { DriverPanel } from './ui/driverPanel.js';
+import { WeatherWidget } from './ui/weatherWidget.js';
+import { StandingsWidget } from './ui/standingsWidget.js';
+import { RadioController } from './ui/radio.js';
+import { FocusedTelemetry } from './data/telemetry.js';
 import { SessionPicker, Transport, initSettings } from './ui/controls.js';
 import { LiveBlockError } from './api/openf1.js';
 import { ProviderManager } from './data/providers/manager.js';
@@ -35,6 +39,7 @@ const dom = {
 };
 
 let renderer, carMgr, store, buffer, clock, hud, transport, driverPanel, track;
+let focusTelemetry, radio, weatherWidget, standingsWidget; // enriched-panel + right stack
 let focused = false; // a driver is focused (camera follow + sector track tint)
 let running = false;
 let liveRetryTimer = null;
@@ -187,6 +192,11 @@ async function loadSession(session, meta = {}) {
   unfocus();
   if (carMgr) { carMgr.dispose(); carMgr = null; }
   if (track) { renderer.remove(track.group); track.dispose && track.dispose(); track = null; }
+  // Dispose per-session enriched-panel + widget state (telemetry buffer, audio).
+  if (focusTelemetry) { focusTelemetry.dispose(); focusTelemetry = null; }
+  if (radio) { radio.dispose(); radio = null; }
+  weatherWidget = null;
+  standingsWidget = null;
 
   try {
     const newStore = new SessionStore(session, providers);
@@ -243,6 +253,24 @@ async function loadSession(session, meta = {}) {
     driverPanel = new DriverPanel({ store });
     driverPanel.onClose = () => unfocus();
 
+    // Focused-driver telemetry buffer + team-radio controller (wired into the
+    // panel). Both are session-scoped and disposed on the next loadSession.
+    focusTelemetry = new FocusedTelemetry(store, providers);
+    radio = new RadioController({ store });
+    driverPanel.telemetry = focusTelemetry;
+    driverPanel.radio = radio;
+
+    // Right-hand stack: weather (replay-time-aware) + championship standings
+    // (going into this race, from Jolpica). Shown whenever a session is loaded.
+    weatherWidget = new WeatherWidget({ store, el: document.getElementById('weather-widget') });
+    standingsWidget = new StandingsWidget({ el: document.getElementById('standings-widget') });
+    weatherWidget.update(startMs);
+    const rightStack = document.getElementById('right-stack');
+    if (rightStack) rightStack.classList.remove('hidden');
+    // Standings load from Jolpica (independent of OpenF1 mode); non-blocking.
+    const stSeason = session.year || (session.date_start ? new Date(session.date_start).getUTCFullYear() : new Date().getUTCFullYear());
+    standingsWidget.load(stSeason, Date.parse(session.date_start));
+
     // Default selection: leader/pole highlighted (no camera focus yet).
     const firstOrder = store.drivers.length ? [store.drivers[0].driver_number] : [];
     if (firstOrder.length) selectDriver(firstOrder[0], false);
@@ -283,6 +311,15 @@ function selectDriver(num, focus = true) {
 function focusDriver(num) {
   focused = true;
   if (driverPanel) driverPanel.show(num);
+  // Start the focused-driver telemetry buffer for this one driver and prefetch
+  // a window around the current cursor; start team radio. Focus is always a user
+  // action (tower click / car click / 'f'), so autoplay is permitted (gesture).
+  const t = clock ? clock.t : (store ? Date.parse(store.timeWindow().start) : Date.now());
+  if (focusTelemetry) {
+    focusTelemetry.start(num);
+    focusTelemetry.update(t, clock ? clock.speed : 1);
+  }
+  if (radio) radio.focus(num, t, true);
   // Follow by INTENT, not by momentary availability: the renderer resolves this
   // function every frame, so follow engages as soon as the car has a sample
   // (and survives brief gaps — buffering, pits) instead of silently never
@@ -295,6 +332,8 @@ function focusDriver(num) {
 function unfocus() {
   focused = false;
   if (driverPanel) driverPanel.hide();
+  if (focusTelemetry) focusTelemetry.stop();
+  if (radio) radio.stop();
   if (renderer) renderer.setFollow(null);
   if (track && track.sectors) track.sectors.reset();
   const btn = document.getElementById('follow-btn');
@@ -428,8 +467,16 @@ function startLoop() {
 
       // (Camera follow is resolved inside renderer.update() every frame.)
 
+      // Focused-driver telemetry prefetch (only while a driver is focused): keep
+      // a window around the cursor loaded, scaled by playback speed, evicting
+      // behind. Stopped/disposed on unfocus + session switch (no leak).
+      if (focused && carMgr.selected != null && focusTelemetry) {
+        focusTelemetry.update(t, clock.speed);
+      }
+
       if (hud) hud.render(t);
       if (driverPanel) driverPanel.update(t);
+      if (weatherWidget) weatherWidget.update(t);
       if (transport) transport.update();
 
       // Sector-based track coloring for the focused driver (smooth lerp).

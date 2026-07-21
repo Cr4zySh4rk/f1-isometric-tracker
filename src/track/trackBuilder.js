@@ -17,6 +17,7 @@ import {
   resampleByArcLength, fitTransform, computeNormals,
   curvature, arcLengths, syntheticOval,
   medianCenterline, resampleAdaptive, smoothAdaptive,
+  nearestIndex, smoothedTangent, tangentHeadingAt,
 } from './trackMath.js';
 import { splitSectorsByLength, SECTOR_COLORS } from '../data/sectors.js';
 
@@ -27,7 +28,10 @@ const WORKING_POINTS = 900; // dense uniform resolution before the adaptive pass
 const MEDIAN_LAPS = 5; // aggregate up to this many clean fast laps
 // v2: median-of-laps centerline + adaptive resampling (key bump invalidates the
 // oversmoothed v1 shapes users may have cached).
-const TRACK_CACHE_VERSION = 2;
+// v3: cache now carries meta.startRaw (the real S/F world coordinate) so the
+// start/finish line re-anchors to the true lap-start point rather than assuming
+// centerline index 0.
+const TRACK_CACHE_VERSION = 3;
 const LS_KEY = (k) => `f1iso.track.v${TRACK_CACHE_VERSION}.${k}`;
 
 // Public: coordinate transform from OpenF1 world (x,y) to scene (x,z).
@@ -90,7 +94,15 @@ export async function buildTrack(store, source) {
   group.add(ribbonGroup);
   // Kerbs and outer walls removed for a cleaner isometric look — the asphalt
   // ribbon alone defines the track.
-  const sf = buildStartFinish(pts, normals, TRACK_WIDTH, meta.startIndex || 0, disposables);
+  // Re-anchor the start/finish line to the real S/F crossing: the median +
+  // adaptive resample can shift which centerline index is point 0, so map the
+  // true S/F world coordinate (meta.startRaw) to its nearest centerline point.
+  let startIndex = meta.startIndex || 0;
+  if (meta.startRaw) {
+    const s = transform.toScene(meta.startRaw.x, meta.startRaw.y);
+    startIndex = nearestIndex(pts.map((v) => ({ x: v.x, y: v.y })), s.x, s.z);
+  }
+  const sf = buildStartFinish(pts, normals, TRACK_WIDTH, startIndex, disposables);
   group.add(sf.group);
 
   const dispose = () => disposeTrack(group, disposables);
@@ -101,9 +113,15 @@ export async function buildTrack(store, source) {
     centerline: pts, // Vector2 in scene space
     centerlineRaw: centerRaw, // {x,y} in provider-world space (for ApproxBuffer arc)
     startFinish: sf.start,
+    startIndex,
     sectors, // { setColors(['purple',...], lerp?), reset() }
+    // Track-tangent heading at an arbitrary provider-world (x,y). Same angle
+    // convention as a car's velocity heading (atan2(dy,dx) in OpenF1-world), so
+    // callers can feed it through the same model-forward offset. Used to orient
+    // stationary/grid cars along the track.
+    tangentAt: (x, y) => tangentHeadingAt(centerRaw, x, y, 3),
     dispose,
-    meta: { ...meta, totalLen, scale, sectorRanges },
+    meta: { ...meta, totalLen, scale, sectorRanges, startIndex },
   };
 }
 
@@ -191,11 +209,17 @@ async function deriveCenterlineFromData(store, source) {
     passes: 2,
     cornerKeep: 0.85,
   });
+  // The true start/finish crossing: each lap trace is trimmed to begin at the
+  // lap's date_start, i.e. the S/F line, so the first raw sample of the primary
+  // trace is the real S/F world coordinate. Kept so the S/F line re-anchors to
+  // it (the median/adaptive resample can nudge which centerline index is point 0).
+  const startRaw = { x: traces[0][0].x, y: traces[0][0].y };
   return {
     centerline: smooth,
     meta: {
       synthetic: false,
       startIndex: 0,
+      startRaw,
       driver: laps[0].driver_number,
       lapsUsed: laps.slice(0, traces.length).map((l) => ({
         driver_number: l.driver_number, lap_number: l.lap_number,
@@ -356,44 +380,82 @@ function buildWalls(pts, normals, width, disposables) {
   return group;
 }
 
+// Start/finish line. Oriented from a SMOOTHED tangent (averaged over ±3
+// centerline points) so it is straight and truly perpendicular to the track
+// direction — a single-segment tangent is noisy and skews the line on some
+// circuits. The checkerboard spans the full track width (both edges flush with
+// the ribbon), sits just above the asphalt (no z-fighting), and carries a thin
+// white leading line for legibility in the isometric view.
 function buildStartFinish(pts, normals, width, startIndex, disposables) {
   const group = new THREE.Group();
   group.name = 'startfinish';
-  const i = startIndex % pts.length;
+  const n = pts.length;
+  const i = ((startIndex % n) + n) % n;
   const p = pts[i];
-  const nm = normals[i];
-  const half = width / 2;
-  const depth = 2.2;
-  const i2 = (i + 1) % pts.length;
-  const tx = pts[i2].x - p.x, tz = pts[i2].y - p.y;
-  const tlen = Math.hypot(tx, tz) || 1;
-  const tux = tx / tlen, tuz = tz / tlen;
+  const plain = pts.map((v) => ({ x: v.x, y: v.y }));
 
-  const cols = 8;
-  const rows = 4;
+  // Forward (along-track) unit vector and the across-track perpendicular, both
+  // from the smoothed tangent so the two axes are exactly orthogonal.
+  const t = smoothedTangent(plain, i, 3);
+  const w = { x: -t.y, y: t.x }; // perpendicular (across the track)
+
+  const half = width / 2;
+  const depth = 2.6; // along-track depth of the checkered band
+  const cols = 10; // cells across the full width
+  const rows = 3; // cells along the depth
   const cellW = width / cols;
   const cellD = depth / rows;
-  const Y = 0.09;
-  const black = new THREE.MeshStandardMaterial({ color: 0x111417, roughness: 0.6 });
-  const white = new THREE.MeshStandardMaterial({ color: 0xf5f5f5, roughness: 0.6 });
-  disposables.push(black, white);
-  const baseX = p.x + nm.x * half - tux * (depth / 2);
-  const baseZ = p.y + nm.y * half - tuz * (depth / 2);
-  for (let c = 0; c < cols; c++) {
+  const Y = 0.06; // just above the asphalt ribbon (Y = 0.05) → no z-fighting
+
+  const blackPos = [];
+  const whitePos = [];
+  // Quad from across-track span [u0,u1] and along-track span [v0,v1], centered
+  // on the S/F point. Pushed as two triangles (wound CCW seen from above).
+  const quad = (arr, u0, u1, v0, v1) => {
+    const P = (u, v) => [p.x + w.x * u + t.x * v, Y, p.y + w.y * u + t.y * v];
+    const a = P(u0, v0), b = P(u1, v0), c = P(u1, v1), d = P(u0, v1);
+    arr.push(...a, ...b, ...c, ...a, ...c, ...d);
+  };
+  for (let cx = 0; cx < cols; cx++) {
+    const u0 = -half + cx * cellW;
+    const u1 = u0 + cellW;
     for (let r = 0; r < rows; r++) {
-      const mat = (c + r) % 2 === 0 ? black : white;
-      const geo = new THREE.PlaneGeometry(cellW, cellD);
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.rotation.x = -Math.PI / 2;
-      const acx = baseX - nm.x * (c * cellW) + tux * (r * cellD);
-      const acz = baseZ - nm.y * (c * cellW) + tuz * (r * cellD);
-      mesh.position.set(acx + nm.x * cellW / 2, Y, acz + nm.y * cellW / 2);
-      mesh.rotation.z = Math.atan2(tuz, tux);
-      group.add(mesh);
-      disposables.push(geo);
+      const v0 = -depth / 2 + r * cellD;
+      const v1 = v0 + cellD;
+      quad((cx + r) % 2 === 0 ? blackPos : whitePos, u0, u1, v0, v1);
     }
   }
+
+  const black = new THREE.MeshStandardMaterial({ color: 0x111417, roughness: 0.65, side: THREE.DoubleSide });
+  const white = new THREE.MeshStandardMaterial({ color: 0xf5f5f5, roughness: 0.6, side: THREE.DoubleSide });
+  const lineMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, side: THREE.DoubleSide });
+  disposables.push(black, white, lineMat);
+  group.add(checkerMesh(blackPos, black, disposables));
+  group.add(checkerMesh(whitePos, white, disposables));
+
+  // Subtle solid white line along the leading (finish) edge, full width, a hair
+  // higher so it reads cleanly over the checker.
+  const linePos = [];
+  const lineY = Y + 0.01;
+  {
+    const v1 = depth / 2, v0 = v1 - 0.35;
+    const P = (u, v) => [p.x + w.x * u + t.x * v, lineY, p.y + w.y * u + t.y * v];
+    const a = P(-half, v0), b = P(half, v0), c = P(half, v1), d = P(-half, v1);
+    linePos.push(...a, ...b, ...c, ...a, ...c, ...d);
+  }
+  group.add(checkerMesh(linePos, lineMat, disposables));
+
   return { start: p, group };
+}
+
+function checkerMesh(positions, mat, disposables) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.receiveShadow = true;
+  disposables.push(geo);
+  return mesh;
 }
 
 // --- helpers ---------------------------------------------------------------

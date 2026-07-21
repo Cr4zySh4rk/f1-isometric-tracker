@@ -8,6 +8,7 @@ import {
   fastestLapAt, bestLapByDriverAt, currentLapAt, lastCompletedLap,
   startingPositions, isInPitAt,
 } from './timing.js';
+import { classifiedOut, retirementTimeMs, isRetiredAt } from './retirement.js';
 
 const LS_PREFIX = 'f1iso.session.';
 
@@ -63,12 +64,13 @@ export class SessionStore {
 
     const src = this.source;
     const s = this.session;
-    const [drivers, laps, positions, raceControl, pit] = await Promise.all([
+    const [drivers, laps, positions, raceControl, pit, result] = await Promise.all([
       cachedDrivers ? Promise.resolve(cachedDrivers) : safe(() => src.getDrivers(s), []),
       cachedLaps ? Promise.resolve(cachedLaps) : safe(() => src.getLaps(s), []),
       safe(() => src.getPositions(s), []),
       safe(() => src.getRaceControl(s), []),
       safe(() => src.getPit(s), []),
+      safe(() => (src.getSessionResult ? src.getSessionResult(s) : []), []),
     ]);
 
     this.drivers = normalizeDrivers(drivers);
@@ -77,7 +79,9 @@ export class SessionStore {
     this.raceControl = Array.isArray(raceControl) ? raceControl : [];
     this.rcEvents = normalizeRaceControl(this.raceControl);
     this.pit = Array.isArray(pit) ? pit : [];
+    this.result = Array.isArray(result) ? result : [];
     this._startPositions = startingPositions(this.positions);
+    this._buildRetirements();
 
     for (const d of this.drivers) this.driversByNumber.set(d.driver_number, d);
 
@@ -160,6 +164,35 @@ export class SessionStore {
   // Is the driver in the pits at time T?
   isInPitAt(num, tMs) {
     return isInPitAt(this.pit, num, tMs);
+  }
+
+  // --- retirement / DNF -----------------------------------------------------
+
+  // Build the classified-out map (from /session_result) plus an estimated
+  // retirement time per driver (from /laps). Cheap; computed once at load.
+  _buildRetirements() {
+    this.retiredInfo = classifiedOut(this.result); // Map(num -> {dnf,dns,dsq,laps})
+    this._retireMs = new Map();
+    for (const num of this.retiredInfo.keys()) {
+      this._retireMs.set(num, retirementTimeMs(this.laps, num));
+    }
+  }
+
+  // Did this driver fail to be classified as a finisher (dnf/dns/dsq)?
+  isClassifiedOut(num) {
+    return !!(this.retiredInfo && this.retiredInfo.has(num));
+  }
+
+  // Estimated retirement time (ms epoch) for a driver, or null.
+  retireTime(num) {
+    return this._retireMs ? this._retireMs.get(num) ?? null : null;
+  }
+
+  // Is the driver classified as retired as of replay time T? (Time-aware: false
+  // before their retirement so scrubbing back un-retires them.)
+  retiredAt(num, tMs) {
+    if (!this.isClassifiedOut(num)) return false;
+    return isRetiredAt(this.retireTime(num), tMs);
   }
 }
 

@@ -99,6 +99,42 @@ Cars orient along velocity vector; wheels spin with speed.
   so they are not pickable/followable, and they are excluded from the timing tower,
   fastest-lap and sector logic.
 
+### Recent upgrades (T5–T7)
+- **T5 — grid / stationary heading.** A car's heading is a finite difference of
+  its telemetry velocity, which is undefined when it's stopped — so on the grid
+  cars pointed in random directions (real data: Silverstone 2026 grid reads ~0
+  dm/s vs 400–850 dm/s racing). `engine/interp.js` now exposes a per-sample
+  `speed` (dm/s), and `trackMath.js` adds `nearestIndex` / `smoothedTangent` /
+  `tangentHeadingAt`. `buildTrack` returns `track.tangentAt(worldX,worldY)` — the
+  forward track direction at the nearest centerline point (same angle convention
+  as a velocity heading). `scene/cars.js` chooses the heading with the pure
+  `chooseHeading()`: below `SLOW_SPEED` (40 dm/s ≈ 14 km/h) it orients along the
+  track tangent, otherwise along velocity, and it damps the heading lerp harder
+  at low speed. The harness proves all 21 stationary grid cars square to the
+  tangent (≤ 20°) where the raw velocity heading was misaligned for the field.
+- **T6 — start/finish line.** `buildStartFinish` orients the checkerboard from a
+  **smoothed tangent** (`smoothedTangent`, ±3 centerline points) instead of a
+  single noisy segment (Silverstone S/F skew 23° → 0.2°), and re-anchors
+  `startIndex` to the real S/F crossing (`meta.startRaw`, the first sample of the
+  trimmed fast-lap trace → nearest centerline point; cache bumped to **v3**). The
+  band is rebuilt as merged full-width quads flush to both ribbon edges, just
+  above the asphalt (Y 0.06, ribbon 0.05 — no z-fighting), with a thin white
+  leading line. `scripts/trackDump.mjs` draws the S/F line + tangent arrow and
+  reports the skew (evidence: `test/evidence/<circuit>_{before,after}.svg`).
+- **T7 — DNF / retirement.** `data/retirement.js` (pure) + `/session_result`
+  (loaded by `sessionStore.js`) handle retired cars, all replay-time-aware:
+  `classifiedOut` (dnf/dns/dsq), `retirementTimeMs` (estimated from `/laps`),
+  `isRetiredAt` (tower classification at T) and `retirementDisplayAt` (per-frame
+  car state). A retired car is shown racing until it comes to REST after its
+  retirement, then STOPPED (greyed "OUT" label), then faded and REMOVED a few
+  seconds later — driven by *either* telemetry ending *or* a replay-time
+  rest-timer (`scene/cars.js`), because a real wreck keeps transmitting its
+  parked position for many minutes (#27 pinged for ~35 min). It is fully
+  time-aware: scrubbing back before the retirement re-shows the car moving. The
+  timing tower greys retired drivers and sorts them to the classified tail
+  (`buildTowerRows` `retiredFn`), and the follow camera releases with a toast if
+  the followed car retires (`main.js`).
+
 ### Playback vs live
 One code path: the replay engine always renders "session time T". In replay, T is
 driven by the playback clock. In live mode, T = now − 3 s and the buffer polls the

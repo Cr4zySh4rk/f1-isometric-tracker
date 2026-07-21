@@ -115,6 +115,51 @@ export function curvature(pts) {
   return curv;
 }
 
+// Index of the centerline point nearest to (x, y). Plain linear scan — the
+// centerline is only ~RESAMPLE_POINTS long, so this is cheap even per car per
+// frame (20 cars × 700 points). Accepts {x,y} points (Vector2 works too).
+export function nearestIndex(pts, x, y) {
+  let best = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const dx = pts[i].x - x;
+    const dy = pts[i].y - y;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
+// Smoothed unit tangent (direction of travel) at centerline index `i`, averaged
+// over a ±window neighborhood so a single noisy segment can't skew it. The
+// centerline is a closed loop, so neighbors wrap. Returns a unit {x,y} pointing
+// in the centerline's winding direction (the direction cars drive).
+export function smoothedTangent(pts, i, window = 3) {
+  const n = pts.length;
+  let tx = 0, ty = 0;
+  for (let k = 1; k <= window; k++) {
+    const a = pts[(i - k + n) % n];
+    const b = pts[(i + k) % n];
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    tx += dx / len;
+    ty += dy / len;
+  }
+  const len = Math.hypot(tx, ty) || 1;
+  return { x: tx / len, y: ty / len };
+}
+
+// Forward-tangent heading (atan2) at the centerline point nearest to (x, y),
+// smoothed over ±window points. Same angle convention as a velocity heading
+// atan2(dy, dx) in whatever frame `pts` live in.
+export function tangentHeadingAt(pts, x, y, window = 3) {
+  if (!pts || pts.length < 2) return null;
+  const i = nearestIndex(pts, x, y);
+  const t = smoothedTangent(pts, i, window);
+  return Math.atan2(t.y, t.x);
+}
+
 // Cumulative arc length per point + total (closed loop) for a scene-space
 // centerline of {x,y}.
 export function arcLengths(pts) {

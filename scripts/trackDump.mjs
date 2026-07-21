@@ -57,7 +57,7 @@ globalThis.fetch = async (url, opts) => {
 const { SessionStore } = await import('../src/data/sessionStore.js');
 const { OpenF1Provider } = await import('../src/data/providers/openf1Provider.js');
 const { buildTrack } = await import('../src/track/trackBuilder.js');
-const { resampleByArcLength, smoothClosed, totalPerimeter } = await import('../src/track/trackMath.js');
+const { resampleByArcLength, smoothClosed, totalPerimeter, smoothedTangent } = await import('../src/track/trackMath.js');
 const { fastestLapAt } = await import('../src/data/timing.js');
 
 const OUT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'test', 'evidence');
@@ -78,9 +78,35 @@ function closedLength(pts) {
   return s + Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+// Compute the S/F line + normal for a centerline at index `si`, using the same
+// SMOOTHED tangent (±window points) the real S/F builder uses. Returns raw-space
+// geometry: the S/F point, the across-track line endpoints (perpendicular to the
+// smoothed tangent) and a short tangent (direction-of-travel) arrow. When
+// window=1 this reproduces the OLD single-segment tangent for the "before" dump.
+function sfGeom(pts, si, halfW, window) {
+  const n = pts.length;
+  const i = ((si % n) + n) % n;
+  const c = pts[i];
+  let t;
+  if (window <= 1) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    t = { x: (b.x - a.x) / len, y: (b.y - a.y) / len };
+  } else {
+    t = smoothedTangent(pts, i, window);
+  }
+  const nm = { x: -t.y, y: t.x }; // across-track
+  return {
+    c,
+    a: { x: c.x + nm.x * halfW, y: c.y + nm.y * halfW },
+    b: { x: c.x - nm.x * halfW, y: c.y - nm.y * halfW },
+    tip: { x: c.x + t.x * halfW * 1.4, y: c.y + t.y * halfW * 1.4 },
+  };
+}
+
 // SVG in the app's top-view orientation: screen-x = raw x, screen-y follows the
 // scene mapping used by makeTransform/renderer (see trackBuilder.toScene).
-function dumpSvg(file, pts, title) {
+function dumpSvg(file, pts, title, sf) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of pts) {
     minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
@@ -92,13 +118,19 @@ function dumpSvg(file, pts, title) {
   const px = (p) => (30 + (p.x - minX) * scale).toFixed(1);
   const py = (p) => (60 + (maxY - p.y) * scale).toFixed(1); // raw +y = screen up (see orientation note)
   const d = pts.map((p, i) => `${i ? 'L' : 'M'}${px(p)},${py(p)}`).join(' ') + ' Z';
-  const sf = pts[0];
+  const marker = sf || { c: pts[0] };
+  const sfLine = sf
+    ? `<line x1="${px(sf.a)}" y1="${py(sf.a)}" x2="${px(sf.b)}" y2="${py(sf.b)}" stroke="#f5f5f5" stroke-width="4"/>
+  <line x1="${px(sf.c)}" y1="${py(sf.c)}" x2="${px(sf.tip)}" y2="${py(sf.tip)}" stroke="#3fb950" stroke-width="3" marker-end="url(#arw)"/>`
+    : '';
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+  <defs><marker id="arw" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#3fb950"/></marker></defs>
   <rect width="100%" height="100%" fill="#0d1117"/>
   <text x="20" y="34" fill="#e6edf3" font-family="monospace" font-size="18">${title}</text>
   <path d="${d}" fill="none" stroke="#58a6ff" stroke-width="3" stroke-linejoin="round"/>
-  <circle cx="${px(sf)}" cy="${py(sf)}" r="6" fill="#f85149"/>
-  <text x="${px(sf)}" y="${(parseFloat(py(sf)) - 10).toFixed(1)}" fill="#f85149" font-family="monospace" font-size="12">S/F</text>
+  ${sfLine}
+  <circle cx="${px(marker.c)}" cy="${py(marker.c)}" r="5" fill="#f85149"/>
+  <text x="${px(marker.c)}" y="${(parseFloat(py(marker.c)) - 10).toFixed(1)}" fill="#f85149" font-family="monospace" font-size="12">S/F</text>
 </svg>\n`;
   fs.writeFileSync(file, svg);
 }
@@ -126,10 +158,28 @@ for (const c of CIRCUITS) {
 
   const lb = closedLength(before) * RAW_TO_M;
   const la = closedLength(after) * RAW_TO_M;
-  console.log(`${c.name}: official=${c.official} m  before=${lb.toFixed(0)} m (${(100 * (lb - c.official) / c.official).toFixed(1)}%)  after=${la.toFixed(0)} m (${(100 * (la - c.official) / c.official).toFixed(1)}%)  lapsUsed=${(track.meta.lapsUsed || []).length}`);
 
-  dumpSvg(path.join(OUT_DIR, `${c.name}_before.svg`), before, `${c.name} BEFORE (v1 single-lap, oversmoothed) ~${lb.toFixed(0)} m`);
-  dumpSvg(path.join(OUT_DIR, `${c.name}_after.svg`), after, `${c.name} AFTER (v2 median+adaptive) ~${la.toFixed(0)} m / official ${c.official} m`);
+  // S/F line evidence. Raw across-track half-width from the built scale
+  // (TRACK_WIDTH=12 scene units). BEFORE = old single-segment tangent at index 0;
+  // AFTER = smoothed tangent (±3) at the re-anchored startIndex.
+  const rawHalfW = 6 / track.meta.scale;
+  const sfBefore = sfGeom(before, 0, rawHalfW, 1);
+  const sfAfter = sfGeom(after, track.startIndex || 0, rawHalfW, 3);
+  // SKEW check: how far from truly perpendicular the drawn S/F line sits vs a
+  // ROBUST reference track direction (±6-point smoothed tangent) at the same
+  // point. 0° = perfectly square across the track. The single-segment tangent
+  // (before) is noisy → skewed; the smoothed tangent (after) is square.
+  const skewDeg = (pts, si, sf) => {
+    const n = pts.length; const i = ((si % n) + n) % n;
+    const ref = smoothedTangent(pts, i, 6);
+    const lx = sf.a.x - sf.b.x, ly = sf.a.y - sf.b.y; // S/F line direction
+    const cos = (lx * ref.x + ly * ref.y) / (Math.hypot(lx, ly) || 1);
+    return Math.abs(90 - Math.acos(Math.min(1, Math.abs(cos))) * 180 / Math.PI);
+  };
+  console.log(`${c.name}: official=${c.official} m  before=${lb.toFixed(0)} m (${(100 * (lb - c.official) / c.official).toFixed(1)}%)  after=${la.toFixed(0)} m (${(100 * (la - c.official) / c.official).toFixed(1)}%)  lapsUsed=${(track.meta.lapsUsed || []).length}  startIndex=${track.startIndex}  S/F skew-from-square: before=${skewDeg(before, 0, sfBefore).toFixed(1)}° after=${skewDeg(after, track.startIndex || 0, sfAfter).toFixed(1)}° (0=perfect)`);
+
+  dumpSvg(path.join(OUT_DIR, `${c.name}_before.svg`), before, `${c.name} BEFORE (v1 single-lap, oversmoothed) ~${lb.toFixed(0)} m`, sfBefore);
+  dumpSvg(path.join(OUT_DIR, `${c.name}_after.svg`), after, `${c.name} AFTER (v2 median+adaptive) ~${la.toFixed(0)} m / official ${c.official} m`, sfAfter);
   fs.writeFileSync(path.join(OUT_DIR, `${c.name}_after.json`), JSON.stringify(after));
   fs.writeFileSync(path.join(OUT_DIR, `${c.name}_before.json`), JSON.stringify(before));
   track.dispose();

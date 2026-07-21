@@ -9,6 +9,13 @@
 const GAP_FADE_START = 10000; // ms — begin fading when the surrounding gap exceeds this
 const GAP_FADE_FULL = 13000; // ms — fully faded
 
+// Below this local speed a car's velocity direction is unreliable (grid,
+// stationary, crawling), so orientation should come from the track tangent
+// instead of the noisy finite-difference heading. Units: OpenF1 location units
+// (decimetres) per second. Real data: cars on the grid read ~0 dm/s; even a
+// slow racing car reads > 350 dm/s (≈ 130 km/h); the pit limit is ~220 dm/s.
+export const SLOW_SPEED = 40; // ≈ 14 km/h
+
 export class DriverTrack {
   constructor(driverNumber) {
     this.driverNumber = driverNumber;
@@ -74,9 +81,16 @@ export class DriverTrack {
 
   /**
    * Sample the driver's state at time t (ms epoch).
-   * Returns { x, y, z, heading, present, alpha } or null if no data at all.
+   * Returns { x, y, z, heading, speed, present, alpha, endGap } or null if there
+   * is no data at all.
    *  - present: false if t is outside the sample range.
    *  - alpha: 0..1 opacity accounting for data gaps (pits) and edges.
+   *  - speed: local speed in location-units (dm) per second; ~0 when stationary
+   *    (grid / stopped) so callers can orient by the track tangent instead of a
+   *    noisy velocity heading.
+   *  - endGap: ms elapsed since the driver's LAST sample (0 while t is within the
+   *    sampled range). Lets callers detect "telemetry has stopped updating"
+   *    (retirements) independently of the pit/coverage gap fade.
    */
   sampleAt(t) {
     this.ensureSorted();
@@ -85,14 +99,14 @@ export class DriverTrack {
 
     if (t <= s[0].t) {
       const near = (s[0].t - t) < 2000;
-      return { x: s[0].x, y: s[0].y, z: s[0].z, heading: this._headingAt(0), present: near, alpha: near ? 1 : 0 };
+      return { x: s[0].x, y: s[0].y, z: s[0].z, heading: this._headingAt(0), speed: this._speedAt(0), present: near, alpha: near ? 1 : 0, endGap: 0 };
     }
     if (t >= s[s.length - 1].t) {
       const gap = t - s[s.length - 1].t;
       return {
         x: s[s.length - 1].x, y: s[s.length - 1].y, z: s[s.length - 1].z,
-        heading: this._headingAt(s.length - 1), present: gap < 2000,
-        alpha: gapAlpha(gap * 2),
+        heading: this._headingAt(s.length - 1), speed: 0, present: gap < 2000,
+        alpha: gapAlpha(gap * 2), endGap: gap,
       };
     }
 
@@ -108,7 +122,7 @@ export class DriverTrack {
       const hold = frac < 0.5 ? p1 : p2;
       return {
         x: hold.x, y: hold.y, z: hold.z, heading: this._headingAt(frac < 0.5 ? i : i + 1),
-        present: false, alpha: gapAlpha(localGap),
+        speed: 0, present: false, alpha: gapAlpha(localGap), endGap: 0,
       };
     }
 
@@ -127,7 +141,11 @@ export class DriverTrack {
     let heading = Math.atan2(y2 - y, x2 - x);
     if (!isFinite(heading)) heading = this._headingAt(i);
 
-    return { x, y, z, heading, present: true, alpha: 1 };
+    // Local speed (dm/s) from the two bracketing samples — used to decide when
+    // the velocity heading is trustworthy vs. the car is stationary/crawling.
+    const speed = dt > 0 ? Math.hypot(p2.x - p1.x, p2.y - p1.y) / (dt / 1000) : 0;
+
+    return { x, y, z, heading, speed, present: true, alpha: 1, endGap: 0 };
   }
 
   _headingAt(i) {
@@ -137,6 +155,29 @@ export class DriverTrack {
     if (!a || !b || a === b) return 0;
     return Math.atan2(b.y - a.y, b.x - a.x);
   }
+
+  // Local speed (dm/s) around sample index i, from the pair (i, i+1) or (i-1, i).
+  _speedAt(i) {
+    const s = this.samples;
+    const a = s[i], b = s[i + 1] || s[i - 1];
+    if (!a || !b || a === b) return 0;
+    const dt = Math.abs(b.t - a.t);
+    return dt > 0 ? Math.hypot(b.x - a.x, b.y - a.y) / (dt / 1000) : 0;
+  }
+}
+
+// Pure decision: which heading should a car use given its telemetry velocity
+// heading and the local track-tangent heading? When the car is moving faster
+// than `threshold` the velocity heading is reliable; below it (grid, stopped,
+// crawling) the finite-difference velocity is noise, so fall back to the track
+// tangent so grid cars face straight down the track. Returns an angle (radians)
+// in the same convention as the inputs.
+export function chooseHeading({ velocityHeading, tangentHeading, speed, threshold = SLOW_SPEED }) {
+  const velOk = velocityHeading != null && isFinite(velocityHeading);
+  const tanOk = tangentHeading != null && isFinite(tangentHeading);
+  if (!tanOk) return velOk ? velocityHeading : 0;
+  if (!velOk) return tangentHeading;
+  return speed < threshold ? tangentHeading : velocityHeading;
 }
 
 function gapAlpha(gap) {

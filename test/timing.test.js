@@ -122,6 +122,24 @@ describe('buildTowerRows', () => {
     expect(rows[2].delta).toBe('+1.534'); // LEC gap-to-leader, not interval
   });
 
+  it('race mode: retired drivers are flagged OUT and sorted to the classified tail', () => {
+    const rows = buildTowerRows({
+      isRace: true, driverNums: NUMS, laps, positions, tMs: T('13:15:30'),
+      intervalFn, intervalMode: 'interval',
+      startPositions: startingPositions(positions),
+      retiredFn: (num) => num === 1, // VER (would be P2) retires
+    });
+    // VER sinks to the bottom despite a live P2 in the /position feed.
+    expect(rows[rows.length - 1].num).toBe(1);
+    const ver = rows.find((r) => r.num === 1);
+    expect(ver.retired).toBe(true);
+    expect(ver.delta).toBe('OUT');
+    expect(ver.deltaKind).toBe('retired');
+    // Running order among the rest is preserved and re-ranked 1..N.
+    expect(rows.filter((r) => !r.retired).map((r) => r.num)).toEqual([44, 16, 4]);
+    expect(rows.map((r) => r.rank)).toEqual([1, 2, 3, 4]);
+  });
+
   it('practice mode: P1 best time, deltas, NO TIME', () => {
     const rows = buildTowerRows({
       isRace: false, driverNums: NUMS, laps, positions: [], tMs: T('13:06:00'),

@@ -217,6 +217,9 @@ async function loadSession(session, meta = {}) {
     if (approx) showApproxBanner();
 
     carMgr = new CarManager(renderer, store, track.transform);
+    // Orient stationary/grid cars along the track tangent (not their noisy
+    // near-zero velocity heading).
+    if (track.tangentAt) carMgr.setTangentProvider(track.tangentAt);
 
     const { start, end } = store.timeWindow();
     let startMs = Date.parse(start), endMs = Date.parse(end);
@@ -414,6 +417,14 @@ function startLoop() {
       buffer.update(t, clock.speed);
       const samples = buffer.sampleAll(t);
       carMgr.update(samples, dt, t);
+
+      // If the followed car retires (recovered off track), gracefully release
+      // the camera with a toast instead of following an empty patch of track.
+      if (focused && carMgr.selected != null && store && store.retiredAt(carMgr.selected, t)) {
+        const acr = store.acronym(carMgr.selected);
+        unfocus();
+        showToast(`${acr} retired — camera released`, 'warn');
+      }
 
       // (Camera follow is resolved inside renderer.update() every frame.)
 

@@ -74,6 +74,108 @@ const { JolpicaProvider } = await import('../../src/data/providers/jolpicaProvid
 const { requestBudgetPerMin } = await import('../../src/data/windowPlan.js');
 const { lapAtTime, buildTowerRows } = await import('../../src/data/timing.js');
 const { classifyEntrant } = await import('../../src/data/entrants.js');
+// Items under test this pass: grid heading (chooseHeading/SLOW_SPEED + track
+// tangent) and DNF removal (retirementDisplayAt + store.retiredAt).
+const { chooseHeading, SLOW_SPEED } = await import('../../src/engine/interp.js');
+const { retirementDisplayAt } = await import('../../src/data/retirement.js');
+
+const angDiff = (a, b) => {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+};
+const RAD = 180 / Math.PI;
+
+// ITEM 1 — grid heading. Just before lights-out (lap 1 start) the field is
+// stationary on the grid, so telemetry velocity gives a random/undefined
+// heading. Assert the FIX (orient by the track tangent when speed < SLOW_SPEED)
+// squares every stationary car to the track (within ~20°), whereas the raw
+// velocity heading was NOT aligned for the field (the reported bug).
+async function gridHeadingCheck(track, buffer, store) {
+  let lightsOut = Infinity;
+  for (const l of store.laps) {
+    if (l.lap_number === 1 && l.date_start) lightsOut = Math.min(lightsOut, Date.parse(l.date_start));
+  }
+  if (!isFinite(lightsOut)) return { ok: false, why: 'no lap 1' };
+  const T = lightsOut - 8000; // stationary on the grid
+  await awaitWindows(buffer, T);
+  const samples = buffer.sampleAll(T);
+  let stationary = 0, alignedFixed = 0, misalignedRaw = 0, worstFixed = 0;
+  for (const [num, s] of samples) {
+    if (!store.driversByNumber.has(num)) continue; // ignore SC/medical
+    if (s.speed == null || s.speed >= SLOW_SPEED) continue; // only stationary/crawling
+    stationary++;
+    const tan = track.tangentAt(s.x, s.y);
+    const chosen = chooseHeading({ velocityHeading: s.heading, tangentHeading: tan, speed: s.speed });
+    const dFixed = Math.abs(angDiff(chosen, tan)) * RAD;
+    const dRaw = Math.abs(angDiff(s.heading, tan)) * RAD;
+    if (dFixed <= 20) alignedFixed++;
+    if (dRaw > 20) misalignedRaw++;
+    worstFixed = Math.max(worstFixed, dFixed);
+  }
+  const ok = stationary >= 10 && alignedFixed >= Math.ceil(stationary * 0.9) && misalignedRaw >= 1;
+  return { ok, stationary, alignedFixed, misalignedRaw, worstFixedDeg: +worstFixed.toFixed(1) };
+}
+
+// ITEM 3 — DNF removal. A classified-out driver (session_result dnf) must be
+// present + moving before retirement, then — replaying the exact CarManager rest
+// timer over real telemetry — shown STOPPED and then REMOVED (alpha 0) a few
+// seconds after it comes to rest, EVEN WHILE its transponder keeps transmitting
+// the parked position (real data: #27 pings its parked spot for ~35 min). And it
+// must be present + moving again when sampled at an earlier T (scrub-back).
+async function dnfCheck(store, buffer, track, num) {
+  if (!store.isClassifiedOut(num)) return { ok: false, why: `#${num} not classified out` };
+  const retireMs = store.retireTime(num);
+  if (retireMs == null) return { ok: false, why: 'no retireMs' };
+
+  // Before retirement: racing, moving, not classified-retired.
+  const Tbefore = retireMs - 240000; // ~4 min earlier (mid-race, at speed)
+  await awaitWindows(buffer, Tbefore);
+  const sB = buffer.sampleAll(Tbefore).get(num);
+  const movingBefore = !!(sB && sB.present && sB.speed >= SLOW_SPEED);
+  const notRetiredBefore = store.retiredAt(num, Tbefore) === false;
+
+  // Load the retirement + park span, then replay frames maintaining the rest
+  // timer exactly like scene/cars.js.
+  await awaitWindows(buffer, retireMs + 30000);
+  await awaitWindows(buffer, retireMs + 120000);
+  const tr = buffer.tracks.get(num);
+  const lastMs = tr && tr.bounds() ? tr.bounds().end : null;
+
+  let restMs = null, sawStopped = false, removedWhileParked = false, removedAtGone = false;
+  let stopAlphaMin = 1, parkedSpeed = null;
+  for (let t = retireMs - 5000; t <= retireMs + 150000; t += 1000) {
+    const s = tr.sampleAt(t);
+    if (!s) continue;
+    const retiredAtT = store.retiredAt(num, t);
+    const stationary = s.speed != null && s.speed < SLOW_SPEED;
+    if (retiredAtT && stationary) { if (restMs == null) restMs = t; } else { restMs = null; }
+    const restElapsedMs = restMs != null ? Math.max(0, t - restMs) : 0;
+    const rd = retirementDisplayAt({ isClassifiedOut: true, present: s.present, endGapMs: s.endGap, restElapsedMs });
+    if (rd.state === 'stopped') { sawStopped = true; stopAlphaMin = Math.min(stopAlphaMin, rd.alpha); }
+    // The key assertion: removed while telemetry is STILL live (parked wreck).
+    if (rd.state === 'removed' && s.present) { removedWhileParked = true; parkedSpeed = s.speed; }
+    if (rd.state === 'removed') removedAtGone = true;
+  }
+  const retiredAfter = store.retiredAt(num, retireMs + 60000) === true;
+
+  // Scrub back before retirement: present + moving again (car re-appears).
+  await awaitWindows(buffer, Tbefore);
+  const sAgain = buffer.sampleAll(Tbefore).get(num);
+  const presentAgain = !!(sAgain && sAgain.present && sAgain.speed >= SLOW_SPEED);
+
+  const ok = movingBefore && notRetiredBefore && sawStopped && removedWhileParked
+    && removedAtGone && retiredAfter && presentAgain;
+  return {
+    ok, num,
+    retireMs: +((retireMs - buffer.startMs) / 1000).toFixed(0),
+    lastTelemetry: lastMs != null ? +((lastMs - buffer.startMs) / 1000).toFixed(0) : null,
+    movingBefore, notRetiredBefore, sawStopped, stopAlphaMin: +stopAlphaMin.toFixed(2),
+    removedWhileParked, parkedSpeed: parkedSpeed != null ? +parkedSpeed.toFixed(1) : null,
+    retiredAfter, presentAgain,
+  };
+}
 
 // OpenF1 /location x,y are DECIMETRES (1 unit ≈ 0.1 m): a derived lap arc length
 // divided by 10 matches the official circuit length to ~1 %. Official lengths
@@ -309,7 +411,25 @@ async function runSession(label, session, opts = {}) {
       ` inTower=${JSON.stringify(sc.scInTower)}`);
   }
 
-  return { synthetic, results, bb, follow, len, lap, novanish, sc };
+  // ITEM 1: grid-heading alignment (stationary cars square to the track tangent).
+  let grid = { ok: true, skipped: true };
+  if (opts.gridHeading && !synthetic) {
+    grid = await gridHeadingCheck(track, buffer, store);
+    console.log(`  ITEM1 grid-heading: ok=${grid.ok} stationaryCars=${grid.stationary}` +
+      ` alignedByTangent=${grid.alignedFixed} misalignedByRawVelocity=${grid.misalignedRaw}` +
+      ` worstFixed=${grid.worstFixedDeg}°`);
+  }
+
+  // ITEM 3: DNF — retired car present+moving before, stopped, then removed.
+  let dnf = { ok: true, skipped: true };
+  if (opts.dnfNum && !synthetic) {
+    dnf = await dnfCheck(store, buffer, track, opts.dnfNum);
+    console.log(`  ITEM3 DNF #${opts.dnfNum}: ok=${dnf.ok} retire~+${dnf.retireMs}s lastTelemetry+${dnf.lastTelemetry}s` +
+      ` movingBefore=${dnf.movingBefore} notRetiredBefore=${dnf.notRetiredBefore} sawStopped=${dnf.sawStopped}(minAlpha=${dnf.stopAlphaMin})` +
+      ` removedWhileParked=${dnf.removedWhileParked}(parkedSpeed=${dnf.parkedSpeed}dm/s) retiredAfter=${dnf.retiredAfter} presentAgainEarlier=${dnf.presentAgain}`);
+  }
+
+  return { synthetic, results, bb, follow, len, lap, novanish, sc, grid, dnf };
 }
 
 // Pick two real completed races from 2026 (a genuine session switch across
@@ -351,12 +471,16 @@ function verdict(r, { minWithin = 15 } = {}) {
   const lap = !r.lap || r.lap.ok;
   const t1 = !r.novanish || r.novanish.ok;
   const t4 = !r.sc || r.sc.ok;
-  const pass = cars && follow && len && lap && t1 && t4;
-  return pass ? 'PASS' : `FAIL(cars=${cars} follow=${follow} len=${len} lap=${lap} t1=${t1} t4=${t4})`;
+  const grid = !r.grid || r.grid.ok;
+  const dnf = !r.dnf || r.dnf.ok;
+  const pass = cars && follow && len && lap && t1 && t4 && grid && dnf;
+  return pass ? 'PASS' : `FAIL(cars=${cars} follow=${follow} len=${len} lap=${lap} t1=${t1} t4=${t4} grid=${grid} dnf=${dnf})`;
 }
 
 const r1 = await runSession('British GP (Silverstone) Race', british, {
   scDate: '2026-07-05T15:18:50+00:00', // first SAFETY CAR DEPLOYED (verified)
+  gridHeading: true, // ITEM 1: grid cars square to the track tangent
+  dnfNum: 27, // ITEM 3: HUL retired lap 37 (session_result dnf=true, verified)
 });
 const r2 = await runSession('Austria (Spielberg) Race — SWITCH', austria);
 // Third circuit (Spa) for T2 length fidelity + a second real SC deployment (T4).

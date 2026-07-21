@@ -241,28 +241,44 @@ export function focusTrackColors(laps, driver, tMs, trackStatus) {
 //   penalties    : Map(num -> [{type,...}])
 //   pitFn        : (num) => boolean
 //   fastestNum   : number | null (session-fastest-lap holder at T)
+//   retiredFn    : (num) => boolean (classified out & retired at T) — retired
+//                  drivers are flagged and sorted to the classified tail.
 export function buildTowerRows(opts) {
   const {
     isRace, driverNums, laps, positions, tMs,
     intervalFn = () => null, intervalMode = 'interval',
     startPositions = new Map(), penalties = new Map(), pitFn = () => false,
-    fastestNum = null,
+    fastestNum = null, retiredFn = () => false,
   } = opts;
 
-  const order = isRace
+  let order = isRace
     ? raceOrderAt(positions, driverNums, tMs)
     : practiceOrderAt(laps, driverNums, tMs);
+
+  // Retired (dnf/dns/dsq) drivers are classified below the running cars, ordered
+  // among themselves by their last running order. A frozen /position feed would
+  // otherwise leave a retired car parked mid-field.
+  const anyRetired = driverNums.some((n) => retiredFn(n));
+  if (anyRetired) {
+    const active = order.filter((o) => !retiredFn(o.num));
+    const retired = order.filter((o) => retiredFn(o.num));
+    order = [...active, ...retired].map((o, i) => ({ ...o, rank: i + 1 }));
+  }
 
   const best = isRace ? null : bestLapByDriverAt(laps, tMs);
   const p1Best = !isRace && order.length && order[0].best != null ? order[0].best : null;
 
   return order.map((o) => {
     const num = o.num;
+    const retired = retiredFn(num);
     const arrow = positionArrow(startPositions.get(num), o.position ?? o.rank);
     const pen = penalties.get(num) || null;
 
     let delta, deltaKind, noTime = false;
-    if (isRace) {
+    if (retired) {
+      delta = 'OUT';
+      deltaKind = 'retired';
+    } else if (isRace) {
       if (o.rank === 1) {
         delta = 'LEADER';
         deltaKind = 'leader';
@@ -296,8 +312,9 @@ export function buildTowerRows(opts) {
       delta,
       deltaKind,
       noTime,
-      isFastest: fastestNum != null && num === fastestNum,
-      inPit: !!pitFn(num),
+      retired,
+      isFastest: !retired && fastestNum != null && num === fastestNum,
+      inPit: !retired && !!pitFn(num),
       penalty: pen && pen.length ? pen[pen.length - 1] : null,
       penalties: pen,
     };

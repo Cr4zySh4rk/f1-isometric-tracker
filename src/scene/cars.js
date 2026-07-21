@@ -9,6 +9,8 @@
 import * as THREE from 'three';
 import { inProgressLap } from '../data/timing.js';
 import { classifyEntrant } from '../data/entrants.js';
+import { chooseHeading, SLOW_SPEED } from '../engine/interp.js';
+import { retirementDisplayAt } from '../data/retirement.js';
 import { fmtLiveLap } from '../util/format.js';
 
 const CAR_SCALE = 3.2; // scene units for car length-ish
@@ -28,7 +30,15 @@ export class CarManager {
     this.group.name = 'cars';
     renderer.add(this.group);
     this._raycaster = new THREE.Raycaster();
+    // Optional: (worldX, worldY) -> track-tangent heading (OpenF1-world angle
+    // convention, same as a velocity heading). Set from main once the track is
+    // built. Used to orient stationary/grid cars along the track instead of
+    // their noisy near-zero velocity heading.
+    this.tangentAt = null;
   }
+
+  // Provide the track's tangent lookup (see trackBuilder `track.tangentAt`).
+  setTangentProvider(fn) { this.tangentAt = fn; }
 
   // Dispose all car geometries/materials/textures (session switch).
   dispose() {
@@ -125,14 +135,50 @@ export class CarManager {
       car.cur.lerp(car.tgt, 0.5);
       car.group.position.copy(car.cur);
 
-      // Heading: OpenF1 world (x,y) → scene (x,z = -y) (mirror fix in the
-      // shared transform): model +Z forward must track (dx, -dy) ⇒ h+π/2.
-      let h = s.heading + Math.PI / 2; // align model's +Z forward
-      car.lastHeading = lerpAngle(car.lastHeading, h, 0.35);
+      // Heading: use the telemetry velocity heading when the car is moving, but
+      // fall back to the track tangent when it's stationary/crawling (grid,
+      // formation, stopped) — a near-zero velocity gives a random finite-diff
+      // heading, so grid cars would otherwise point every which way.
+      const slow = s.speed != null && s.speed < SLOW_SPEED;
+      const tanH = (slow && this.tangentAt) ? this.tangentAt(s.x, s.y) : null;
+      const chosen = chooseHeading({
+        velocityHeading: s.heading, tangentHeading: tanH,
+        speed: s.speed == null ? Infinity : s.speed,
+      });
+      // OpenF1 world (x,y) → scene (x,z = -y) (mirror fix in the shared
+      // transform): model +Z forward must track (dx, -dy) ⇒ h+π/2.
+      const h = chosen + Math.PI / 2; // align model's +Z forward
+      // Damp heading jitter harder at low speed so a stationary car doesn't
+      // twitch around the tangent.
+      car.lastHeading = lerpAngle(car.lastHeading, h, slow ? 0.12 : 0.35);
       car.group.rotation.y = car.lastHeading;
 
-      // Fade
-      const targetAlpha = s.alpha == null ? 1 : s.alpha;
+      // Fade — plus DNF/retirement removal for classified-out drivers: once a
+      // retired car's telemetry stops updating it is shown stopped briefly, then
+      // faded out and removed (time-aware: scrubbing back before the retirement
+      // re-shows it moving). Non-retirees are unaffected.
+      let targetAlpha = s.alpha == null ? 1 : s.alpha;
+      let retiredNow = false;
+      if (this.store.isClassifiedOut && this.store.isClassifiedOut(num)) {
+        // Once a retired car has come to REST (past its retirement time), start a
+        // recovery timer in replay time — so a wreck that keeps pinging its
+        // parked position for minutes is still removed a few seconds after it
+        // stops, not left frozen on track. Reset when it's moving or scrubbed
+        // back before the retirement (time-aware).
+        const retiredAtT = tMs != null && this.store.retiredAt(num, tMs);
+        const stationary = s.speed != null && s.speed < SLOW_SPEED;
+        if (retiredAtT && stationary && tMs != null) {
+          if (car.restMs == null) car.restMs = tMs;
+        } else {
+          car.restMs = null;
+        }
+        const restElapsedMs = (car.restMs != null && tMs != null) ? Math.max(0, tMs - car.restMs) : 0;
+        const rd = retirementDisplayAt({ isClassifiedOut: true, present: s.present, endGapMs: s.endGap, restElapsedMs });
+        if (rd) { retiredNow = rd.retired; targetAlpha = Math.min(targetAlpha, rd.alpha); }
+      } else if (car.restMs != null) {
+        car.restMs = null;
+      }
+      car.retired = retiredNow;
       car.alpha += (targetAlpha - car.alpha) * 0.2;
       car.group.visible = car.alpha > 0.02;
       setOpacity(car, car.alpha);
@@ -158,7 +204,9 @@ export class CarManager {
       const ls = (sel ? 1.25 : 1) * labelScale;
       car.label.scale.set(6 * ls, 3.75 * ls, 1);
       let timeStr = '';
-      if (showLapTime && tMs != null) {
+      if (retiredNow) {
+        timeStr = 'OUT'; // greyed/stopped car during its brief on-track stop
+      } else if (showLapTime && tMs != null) {
         const lap = inProgressLap(this.store.laps, num, tMs);
         if (lap && lap.date_start) {
           const ms = tMs - Date.parse(lap.date_start);

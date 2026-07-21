@@ -243,6 +243,11 @@ html, body {
 .tw-selected { background: rgba(225,6,0,0.16); border-left-color: var(--red); }
 .tw-fl { box-shadow: inset 0 0 0 1px rgba(139,63,251,0.55); }
 .tw-inpit { opacity: 0.72; }
+/* Retired / classified out: greyed and desaturated, sorted to the tail. */
+.tw-retired { opacity: 0.5; filter: grayscale(0.7); }
+.tw-retired .tw-bar { filter: grayscale(1); }
+.tw-badge-out { background: #6b7280; color: #e5e7eb; }
+.tw-delta-retired { color: #9aa3ad; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
 .tw-pos { font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
 .tw-arrow { font-size: 10px; text-align: center; }
 .tw-arrow-up { color: #37d67a; }

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   resampleByArcLength, smoothClosed, fitTransform, computeNormals,
   curvature, arcLengths, totalPerimeter, syntheticOval,
+  nearestIndex, smoothedTangent, tangentHeadingAt,
 } from '../src/track/trackMath.js';
 import trace from './fixtures/location_trace.json';
 
@@ -87,5 +88,42 @@ describe('trackMath geometry', () => {
   it('generates a synthetic oval fallback', () => {
     const o = syntheticOval();
     expect(o.length).toBeGreaterThan(100);
+  });
+});
+
+describe('nearest-point + tangent helpers', () => {
+  it('nearestIndex finds the closest centerline point', () => {
+    const c = circle(40, 10);
+    // Point just outside index 0 = (10, 0).
+    expect(nearestIndex(c, 10.4, 0.1)).toBe(0);
+    const q = c[10]; // exact point
+    expect(nearestIndex(c, q.x, q.y)).toBe(10);
+  });
+
+  it('smoothedTangent is perpendicular to the radius on a circle (winds CCW)', () => {
+    const c = circle(120, 50);
+    for (const i of [0, 30, 60, 90]) {
+      const t = smoothedTangent(c, i, 3);
+      // unit length
+      expect(Math.hypot(t.x, t.y)).toBeCloseTo(1, 6);
+      // perpendicular to the radial direction at that point
+      const r = { x: c[i].x, y: c[i].y };
+      const rlen = Math.hypot(r.x, r.y);
+      const dot = (t.x * r.x + t.y * r.y) / rlen;
+      expect(Math.abs(dot)).toBeLessThan(0.05);
+    }
+  });
+
+  it('tangentHeadingAt returns the direction of travel on a straight track', () => {
+    // Points marching in +x ⇒ heading ~0; a query slightly off the line still
+    // snaps to the nearest point's forward tangent.
+    const line = [];
+    for (let i = 0; i < 20; i++) line.push({ x: i, y: 0 });
+    const h = tangentHeadingAt(line, 5.2, 0.3, 3);
+    expect(Math.abs(h)).toBeLessThan(0.05);
+
+    const up = [];
+    for (let i = 0; i < 20; i++) up.push({ x: 0, y: i });
+    expect(tangentHeadingAt(up, 0.1, 5, 3)).toBeCloseTo(Math.PI / 2, 3);
   });
 });

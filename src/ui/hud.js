@@ -154,6 +154,7 @@ export class Hud {
       penalties: this.store.penaltiesAt(tMs),
       pitFn: (num) => this.store.isInPitAt(num, tMs),
       fastestNum: fastest ? fastest.driver_number : null,
+      retiredFn: (num) => this.store.retiredAt(num, tMs),
     });
 
     const frag = document.createDocumentFragment();
@@ -164,10 +165,12 @@ export class Hud {
       el.className = 'tw-row'
         + (r.num === this.selected ? ' tw-selected' : '')
         + (r.isFastest ? ' tw-fl' : '')
-        + (r.inPit ? ' tw-inpit' : '');
+        + (r.inPit ? ' tw-inpit' : '')
+        + (r.retired ? ' tw-retired' : '');
       el.dataset.num = r.num;
 
       const badges = [];
+      if (r.retired) badges.push('<span class="tw-badge tw-badge-out" title="Retired / classified out">OUT</span>');
       if (r.isFastest) badges.push('<span class="tw-badge tw-badge-fl" title="Fastest lap">FL</span>');
       if (r.inPit) badges.push('<span class="tw-badge tw-badge-pit" title="In pit">P</span>');
       if (r.penalty) {
